@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+
+# Scrapy
+*.log
+.crawler/
+
+# Output files
+*.csv
+*.json
+
+# OS
+.DS_Store
+Thumbs.db
