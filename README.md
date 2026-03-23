@@ -1,6 +1,6 @@
 # Google Maps Review Scraper
 
-A production-grade Google Maps review scraper built with Python 3 and Playwright. Automatically discovers all restaurants in any city, sorts them by review count, and scrapes every available review into a single CSV file — including full review text, structured attributes, sub-ratings, and owner replies.
+A Google Maps review scraper built with Python 3 and Playwright. Automatically discovers all restaurants in any city, sorts them by review count, and scrapes every available review into a single CSV file, including full review text, structured attributes, sub-ratings.
 
 ---
 
@@ -10,9 +10,7 @@ A production-grade Google Maps review scraper built with Python 3 and Playwright
 Opens Google Maps, searches for your query (e.g. "restaurants in Hyderabad"), scrolls through all search results, and saves every discovered restaurant with its name, URL, rating, and review count to `discovered_places.csv`.
 
 **Phase 2 — Scraping**
-For each restaurant (sorted highest review count first), opens the listing page, clicks the Reviews tab, sorts by Newest, and scrolls through every review — saving each one to `all_reviews.csv` in real time.
-
-Every run merges with previous runs — no duplicates, no lost data, fully resumable.
+For each restaurant (sorted highest review count first), opens the listing page, clicks the Reviews tab, sorts by Newest, and scrolls through every review, saving each one to `all_reviews.csv` in real time.
 
 ---
 
@@ -20,7 +18,8 @@ Every run merges with previous runs — no duplicates, no lost data, fully resum
 
 ```
 google-review-scraper/
-├── gmaps_reviews_scraper.py    ← core scraper engine (single restaurant)
+├── gmaps_reviews_scraper.py    ← core scraper engine (uses DOM)
+├── gmaps_hybrid_scraper.py     ← scraper engine uses Network interception
 ├── discover_and_scrape.py      ← orchestrator (discover city + scrape many)
 ├── check_proxies.py            ← proxy health checker utility
 └── README.md
@@ -35,30 +34,51 @@ Auto-generated at runtime:
 ```
 
 ---
-
+ 
 ## Output — CSV Columns
-
-Every review is saved with 14 columns:
-
+ 
+Every review is saved with these columns:
+ 
 | Column | What it contains | Example |
 |--------|-----------------|---------|
+| `review_id` | Unique review identifier | `Ci9DQUlRQUNv...` |
 | `place_name` | Restaurant name | `Paradise Biryani \| Secunderabad` |
 | `reviewer_name` | Name of the reviewer | `Rahul Sharma` |
+| `reviewer_id` | Google contributor ID | `109328685807050265243` |
+| `local_guide` | Whether reviewer is a Local Guide | `True` |
 | `rating` | Overall star rating 1–5 | `4` |
-| `review_text` | Customer's written review | `Best biryani in the city` |
-| `owner_reply` | Restaurant's response, if any | `Thank you for visiting!` |
+| `review_text` | Customer's full written review (never truncated) | `Best biryani in the city` |
 | `likes` | Helpful votes on the review | `7` |
 | `date` | When the review was posted | `2 weeks ago` |
-| `dining_mode` | How they visited | `Dine in` |
-| `meal_type` | Which meal | `Lunch` |
-| `price_range` | Spend per person | `₹200–500` |
-| `food_rating` | Sub-rating for food 1–5 | `4` |
-| `service_rating` | Sub-rating for service 1–5 | `3` |
-| `atmosphere_rating` | Sub-rating for atmosphere 1–5 | `5` |
-| `extra_attributes` | Any other attributes as JSON | `{"parking": "Free"}` |
-
-`owner_reply` is stored separately from `review_text` so sentiment analysis runs only on the customer's words.
-
+| `attributes` | All structured attributes as JSON | see below |
+ 
+The `attributes` JSON column contains everything the reviewer filled in:
+ 
+```json
+{
+  "dining_mode": "Dine in",
+  "meal_type": "Lunch",
+  "price_per_person": "₹200–400",
+  "food": 5,
+  "service_rating": 4,
+  "atmosphere": 5,
+  "group_size": "2 people",
+  "vegetarian_recommendation": "Would not recommend",
+  "vegetarian_offerings": "Not sure",
+  "recommended_dishes": "Mutton Haleem, Hyderabad Dum Biryani",
+  "parking_space": "Difficult to find parking",
+  "parking_options": "Valet",
+  "kid_friendliness": "Not kid friendly",
+  "wheelchair_accessibility": "Wheel chair accessibility is not available",
+  "dietary_restrictions": "Options may not be available.",
+  "noise_level": "Moderate noise",
+  "wait_time": "No wait",
+  "seating_type": "Indoor dining area"
+}
+```
+ 
+Keys only appear if the reviewer filled them in.
+ 
 ---
 
 ## Installation
@@ -119,7 +139,7 @@ gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-tim
 
 ---
 
-### Mode 1 — Discover and Scrape a City (recommended)
+### Mode 1 — Discover and Scrape a City
 
 Finds all restaurants matching your query, then scrapes reviews from the top N sorted by review count.
 
@@ -186,6 +206,24 @@ python3 gmaps_reviews_scraper.py \
   --speed fast
 ```
 
+
+### To run gmaps_hybrid_scraper
+To run gmaps_hybrid_scraper using discover_and_scrape.py, then make change to discover_and_scrape.py:
+
+```bash
+from gmaps_hybrid_scraper import (
+    CFG, BrowserSession, ReviewCSVWriter, GoogleMapsReviewScraper,
+    rand_delay, micro_mouse_move, apply_speed_profile, parse_runtime, log,
+)
+```
+To run gmaps_hybrid_scraper to fetch single restaurant run:
+ 
+```bash
+python3 gmaps_hybrid_scraper.py \
+  --url "https://www.google.com/maps/place/Paradise+Biryani/@17.4417141,78.4872154,17z/data=..." \
+  --output reviews.csv
+```
+
 **Available flags:**
 
 | Flag | Default | Description |
@@ -196,16 +234,6 @@ python3 gmaps_reviews_scraper.py \
 | `--speed` | `fast` | Speed profile — `turbo`, `fast`, or `safe` |
 | `--runtime` | no limit | Auto-stop after this long — e.g. `8h`, `3d` |
 | `--headless` | off | Add this flag to hide the browser window |
-
----
-
-## Speed Profiles
-
-| Profile | Approx speed | Reviews/hour | Best for |
-|---------|-------------|-------------|---------|
-| `turbo` | ~80/min | ~4,800 | Short sessions |
-| `fast` | ~45/min | ~2,700 | Daily use — **default** |
-| `safe` | ~20/min | ~1,200 | Overnight unattended runs |
 
 ---
 
@@ -239,7 +267,6 @@ The scraper mimics human browsing behaviour:
 - **Mouse micro-movements** between scroll cycles
 - **Idle pauses** every 100–180 scrolls to simulate reading
 - **Reverse scrolls** occasionally to simulate re-reading
-- **Persistent browser session** that builds real browsing history across runs
 - **Browser fingerprint patches** that remove automation signals
 - **Consent wall handler** that auto-dismisses cookie popups
 - **URL drift detection** that recovers if accidentally navigated away
@@ -252,13 +279,10 @@ The scraper stops automatically when any of these occur:
 
 | Condition | Log message |
 |-----------|------------|
-| Collected within 1% of the listing total | `✅ Collected 911/915 reviews. Stopping.` |
-| 25 consecutive scroll cycles with no new reviews | `📊 Plateau detected. Stopping.` |
-| `--max` count reached | `✅ Target of 5000 reviews reached` |
-| `--runtime` limit reached | `⏱️ Max runtime reached — stopping` |
-| Manual Ctrl+C | `🛑 Shutdown signal received` |
-
-> Google withholds the last 0.5–1% of reviews from the scroll feed regardless of how long you scrape. Getting 911 out of 915 is a complete and successful scrape.
+| 25 consecutive scroll cycles with no new reviews | `Plateau detected. Stopping.` |
+| `--max` count reached | `Target of 5000 reviews reached` |
+| `--runtime` limit reached | `Max runtime reached — stopping` |
+| Manual Ctrl+C | `Shutdown signal received` |
 
 ---
 
@@ -296,7 +320,7 @@ The scraper reached the end of what Google serves for that restaurant and stoppe
 
 
 **Reviews ending with `… More` in the text**
-The "More" button expander runs automatically. If some reviews still appear truncated, Google uses CSS-level truncation on those specific reviews — no button exists and the full text is not in the DOM until you click into the individual review. This affects a small percentage of reviews.
+The "More" button expander runs automatically. If some reviews still appear truncated, Google uses CSS-level truncation on those specific reviews — no button exists and the full text is not in the DOM until you click into the individual review. **This affects a some percentage of reviews if gmaps_review_scraper used, although gains in reviews scraped.**
 
 ---
 
@@ -312,7 +336,3 @@ The "More" button expander runs automatically. If some reviews still appear trun
 | asyncio (stdlib) | Async execution |
 
 ---
-
-## License
-
-MIT — use freely, attribution appreciated.
