@@ -104,7 +104,7 @@ source venv/bin/activate
 
 **3. Install Python dependencies**
 ```bash
-pip install playwright playwright-stealth aiohttp
+pip install playwright playwright-stealth aiohttp httpx
 ```
 
 **4. Install the Chromium browser**
