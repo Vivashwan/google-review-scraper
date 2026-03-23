@@ -26,7 +26,7 @@ from typing import Optional
 from playwright.async_api import Page
 
 sys.path.insert(0, str(Path(__file__).parent))
-from gmaps_reviews_scraper import (
+from gmaps_hybrid_scraper import (
     CFG, BrowserSession, ReviewCSVWriter, GoogleMapsReviewScraper,
     rand_delay, micro_mouse_move, apply_speed_profile, parse_runtime, log,
 )
