@@ -1,18 +1,67 @@
 """
-Google Maps Reviews Scraper — Production Grade
-=================================================
-Author: Anti-Bot Scraping Engineer
-Target: 5,000+ reviews per restaurant listing
-Stack:  Python 3, Playwright (async), playwright-stealth
+Google Maps Reviews Scraper v3 — Hybrid Architecture
+=====================================================
+WHAT CHANGED FROM v2:
+  1. TRUE HYBRID MODE (default)
+     - Phase 1: Network interception — paginate Google's RPC directly.
+       Gets all review_id, name, rating, text, date, likes in minutes.
+       Attributes left blank intentionally (not in RPC response).
+     - Phase 2: Targeted DOM attribute fill — reloads reviews tab,
+       scrolls only to cards in empty_attr_ids, expands them, patches CSV.
+       Does NOT scroll through all 52k reviews — uses scroll-to-index trick.
+
+  2. VIRTUAL SCROLLER STALL FIX (the 700-review cliff)
+     Root cause: Maps' virtual DOM recycles nodes. After ~700 reviews the
+     recycling lag exceeds the 0.5s post-expansion wait, so attribute chips
+     are read in their pre-hydration state ("Dine in…" instead of "Dine in").
+     Fix A: Dynamic wait — scales from 0.5s → 2.0s based on scroll depth.
+     Fix B: Chip truncation detection — if any chip value ends with "…",
+            the card is marked is_truncated=True, same as review text.
+            This feeds the existing 3-attempt retry loop correctly.
+
+  3. DEEP CLEAN NO LONGER NUKES empty_attr_ids CARDS
+     Previous: deep clean every 500 reviews removed ALL cards except last 15,
+               including cards still in empty_attr_ids, killing retry chances.
+     Fixed:    deep clean now explicitly preserves empty_attr_ids cards.
+
+  4. ATTRIBUTE FILL PASS IS TARGETED (not a full re-scroll)
+     For 52k reviews, a naive re-scroll to fill ~2k missing attrs would take
+     hours. Instead: after network phase, we sort empty_attr_ids by their
+     position in the review stream (index), then jump the scroll container
+     directly to that approximate pixel offset, wait for the card to appear,
+     expand, extract, patch. Each card takes ~3-5 seconds. 2k cards ≈ 2 hours.
+
+  5. CSV PATCHING (UPDATE vs APPEND)
+     When DOM pass fills attributes for a previously-written row, we rewrite
+     the CSV row in-place rather than appending a duplicate. This keeps the
+     CSV clean for resumption.
+
+  6. NETWORK MODE IMPROVEMENTS
+     - Logs the full intercepted URL for debugging
+     - Explicit fallback message if RPC pattern changes
+     - Retries up to 3 times per page with exponential backoff
+     - Handles both aiohttp and Playwright fetch fallback cleanly
+
 Usage:
-    pip install playwright playwright-stealth asyncio aiofiles
+    pip install playwright playwright-stealth aiohttp
     playwright install chromium
-    python gmaps_reviews_scraper.py --url "https://maps.google.com/..." --output reviews.csv
+
+    # Recommended: full hybrid (network bulk + DOM attribute fill)
+    python gmaps_reviews_scraper_v3.py --url "https://maps.google.com/..." --output reviews.csv
+
+    # Network only (fastest, no attributes)
+    python gmaps_reviews_scraper_v3.py --url "..." --output reviews.csv --mode network
+
+    # DOM only (slow, all attributes — use --speed safe for best quality)
+    python gmaps_reviews_scraper_v3.py --url "..." --output reviews.csv --mode dom
+
+    # Speed profiles: turbo / fast (default) / safe
+    python gmaps_reviews_scraper_v3.py --url "..." --output reviews.csv --speed safe
 """
 
 import asyncio
 import csv
-import hashlib
+import io
 import json
 import logging
 import os
@@ -22,137 +71,160 @@ import signal
 import sys
 import time
 import argparse
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from datetime import datetime
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page, TimeoutError as PWTimeout
+from playwright.async_api import (
+    async_playwright, Browser, BrowserContext, Page,
+    Request, Response,
+    TimeoutError as PWTimeout,
+)
 
-# ── playwright-stealth v2.x integration ──────────────────────────────────────
-# v2 replaced stealth_async() with a Stealth class + context manager.
-# Usage: async with stealth(context): ...  OR  Stealth().apply_stealth(page)
-# We wrap it so the rest of the code just calls: await apply_stealth(page)
+# ── playwright-stealth integration ───────────────────────────────────────────
 HAS_STEALTH = False
-
 try:
-    import asyncio as _asyncio
     import inspect as _inspect
     from playwright_stealth import Stealth as _Stealth
     _stealth_obj = _Stealth()
 
-    # v2.x has both sync and async variants depending on the exact build.
-    # We probe every known method name and wrap it correctly.
     def _find_method(obj, names):
         for n in names:
             m = getattr(obj, n, None)
-            if m is not None:
-                return n, m
+            if m: return n, m
         return None, None
 
     _page_name, _page_method = _find_method(_stealth_obj, [
-        "stealth_page",        # v2.0.x async
-        "apply_stealth",       # some builds async
-        "apply_stealth_sync",  # some builds SYNC (misleading name)
+        "stealth_page", "apply_stealth", "apply_stealth_sync",
     ])
     _ctx_name, _ctx_method = _find_method(_stealth_obj, [
-        "stealth_context",          # v2.0.x async
-        "apply_stealth_context",    # alt name
+        "stealth_context", "apply_stealth_context",
     ])
 
-    if not _page_method:
-        raise AttributeError(
-            f"No known page method on Stealth(). "
-            f"Available: {[m for m in dir(_stealth_obj) if not m.startswith('_')]}"
-        )
-
-    # Wrap correctly based on whether the method is sync or async
     def _wrap(method):
         if _inspect.iscoroutinefunction(method):
-            async def _async_call(target):
-                await method(target)
+            async def _f(t): await method(t)
         else:
-            async def _async_call(target):
-                result = method(target)
-                # Some sync methods return a coroutine anyway — await if so
-                if _inspect.isawaitable(result):
-                    await result
-        return _async_call
+            async def _f(t):
+                r = method(t)
+                if _inspect.isawaitable(r): await r
+        return _f
 
-    apply_stealth         = _wrap(_page_method)
-    apply_stealth_context = _wrap(_ctx_method) if _ctx_method else None
-
-    HAS_STEALTH = True
-    is_async = _inspect.iscoroutinefunction(_page_method)
-    print(f"[INFO] playwright-stealth v2 active | method={_page_name} | async={is_async}")
-
-except ImportError:
-    print("[WARN] playwright-stealth not found. Run: pip install playwright-stealth")
-    async def apply_stealth(page): pass
-    apply_stealth_context = None
+    apply_stealth         = _wrap(_page_method) if _page_method else None
+    apply_stealth_context = _wrap(_ctx_method)  if _ctx_method  else None
+    HAS_STEALTH = bool(_page_method)
+    print(f"[INFO] playwright-stealth active | method={_page_name}")
 except Exception as e:
-    print(f"[WARN] playwright-stealth failed: {type(e).__name__}: {e}")
-    async def apply_stealth(page): pass
+    print(f"[WARN] playwright-stealth unavailable: {e}")
+    async def apply_stealth(p): pass
     apply_stealth_context = None
 
-if not HAS_STEALTH:
-    print("[WARN] Running WITHOUT stealth — manual JS patches still active.")
-    async def apply_stealth(page): pass
-    apply_stealth_context = None
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("scraper_v3.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("GMapsV3")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 CFG = {
-    # Browser
-    "HEADLESS": False,              # Headful strongly recommended for Maps
-    "VIEWPORT": (1366, 768),        # Common 1366×768 laptop resolution
-    "USER_AGENT": (
+    "HEADLESS":    False,
+    "VIEWPORT":    (1366, 768),
+    "USER_AGENT":  (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "LOCALE": "en-US",
-    "TIMEZONE": "America/New_York",
+    "LOCALE":      "en-US",
+    "TIMEZONE":    "America/New_York",
+    "SESSION_DIR": "./gmaps_session_v3",
 
-    # Session persistence
-    "SESSION_DIR": "./gmaps_session",
+    "MAX_REVIEWS":          10_000_000,
+    "MAX_RUNTIME_SECONDS":  5_184_000,
+    "MAX_SCROLL_PLATEAU":   30,
 
-    # Scraping limits
-    "MAX_REVIEWS": 10_000_000,      # effectively unlimited — use --max to cap
-    "MAX_RUNTIME_SECONDS": 5_184_000,  # 60 days default — override with --runtime
-    "MAX_SCROLL_PLATEAU": 25,
-    "SCROLL_BATCH_SIZE": 12,        # 12 scrolls per extraction cycle (was 5)
+    # DOM mode scroll settings
+    "SCROLL_BATCH_SIZE":         4,
+    "DELAY_BETWEEN_SCROLLS":     (0.25, 0.7),
+    "DELAY_AFTER_CLICK":         (1.0, 2.2),
+    "DELAY_IDLE_PAUSE":          (3.0, 7.0),
+    "IDLE_PAUSE_EVERY":          (200, 350),
+    "REVERSE_SCROLL_EVERY":      (40, 80),
+    "SCROLL_DISTANCE":           (800, 1400),
+    "SCROLL_JUMP":               True,
+    "CONTENT_WAIT_POLL":         0.08,
+    "CONTENT_WAIT_TIMEOUT":      2.0,
 
-    # ── SPEED PROFILES ────────────────────────────────────────────────────────
-    # turbo : ~70-90 reviews/min  — residential IP, short sessions only
-    # fast  : ~35-55 reviews/min  — good daily-use balance  ← DEFAULT
-    # safe  : ~15-25 reviews/min  — original conservative mode
-    # Switch by changing the tuple values below.
-    # ─────────────────────────────────────────────────────────────────────────
+    # FIX: keep more anchors — prevents virtual scroller reset
+    "DOM_PRUNE_KEEP_TAIL":       15,
+    # FIX: deep clean far less often — previous 500 was thrashing
+    "DOM_DEEP_CLEAN_EVERY":      2000,
 
-    # fast profile
-    "DELAY_BETWEEN_SCROLLS": (0.25, 0.7),   # was (1.8, 4.2)
-    "DELAY_AFTER_CLICK":     (1.0, 2.2),    # was (2.0, 4.5)
-    "DELAY_IDLE_PAUSE":      (3.0, 7.0),    # was (8.0, 20.0)
-    "IDLE_PAUSE_EVERY":      (100, 180),    # less frequent pauses
-    "REVERSE_SCROLL_EVERY":  (40, 80),      # less frequent reverse scrolls
-
-    # scroll behaviour
-    "SCROLL_JUMP": True,                    # instant scroll, no smooth animation
-    "SCROLL_DISTANCE": (800, 1400),         # bigger jumps (was 300-700)
-
-    # content-load wait
-    "CONTENT_WAIT_POLL":    0.12,           # poll interval seconds (was 0.4)
-    "CONTENT_WAIT_TIMEOUT": 3.0,           # max wait per cycle (was 8.0)
+    # FIX A — dynamic expansion wait scaling
+    # wait_seconds = BASE + SCALE_PER_1K * (reviews_scraped / 1000)
+    # e.g. at 0 reviews: 0.5s. At 1000: 0.8s. At 5000: 2.0s. Capped at MAX.
+    "EXPAND_WAIT_BASE":          0.5,
+    "EXPAND_WAIT_SCALE_PER_1K":  0.3,
+    "EXPAND_WAIT_MAX":           2.5,
 
     # Anti-block
-    "SLOW_MODE_DELAY":    (4.0, 8.0),
-    "CAPTCHA_PAUSE":      120,
+    "SLOW_MODE_DELAY":           (4.0, 8.0),
+    "CAPTCHA_PAUSE":             120,
+
+    # Network mode
+    "NETWORK_PAGINATION_DELAY":  (0.3, 0.8),
+    "NETWORK_MAX_RETRIES":       3,
+
+    # Attribute fill pass (Phase 2)
+    # How many pixels per review card (approximate, used for jump-scrolling)
+    "APPROX_CARD_HEIGHT_PX":     200,
+    # Max seconds to wait for a target card to appear after jump-scroll
+    "ATTR_FILL_CARD_WAIT":       8.0,
+    # Max scroll attempts to find a card before giving up on it
+    "ATTR_FILL_MAX_SCROLL_ATTEMPTS": 15,
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SELECTORS  (primary + fallbacks — Google Maps changes these regularly)
-# ─────────────────────────────────────────────────────────────────────────────
+SPEED_PROFILES = {
+    "turbo": {
+        "DELAY_BETWEEN_SCROLLS": (0.05, 0.2),
+        "DELAY_AFTER_CLICK":     (0.6, 1.2),
+        "DELAY_IDLE_PAUSE":      (1.5, 3.0),
+        "IDLE_PAUSE_EVERY":      (300, 500),
+        "REVERSE_SCROLL_EVERY":  (150, 300),
+        "SCROLL_BATCH_SIZE":     20,
+        "SCROLL_DISTANCE":       (1200, 2000),
+        "CONTENT_WAIT_TIMEOUT":  1.5,
+    },
+    "fast": {
+        "DELAY_BETWEEN_SCROLLS": (0.25, 0.7),
+        "DELAY_AFTER_CLICK":     (1.0, 2.2),
+        "DELAY_IDLE_PAUSE":      (3.0, 7.0),
+        "IDLE_PAUSE_EVERY":      (200, 350),
+        "REVERSE_SCROLL_EVERY":  (40, 80),
+        "SCROLL_BATCH_SIZE":     4,
+        "SCROLL_DISTANCE":       (800, 1400),
+        "CONTENT_WAIT_TIMEOUT":  2.0,
+    },
+    "safe": {
+        "DELAY_BETWEEN_SCROLLS": (1.8, 4.2),
+        "DELAY_AFTER_CLICK":     (2.0, 4.5),
+        "DELAY_IDLE_PAUSE":      (8.0, 20.0),
+        "IDLE_PAUSE_EVERY":      (40, 80),
+        "REVERSE_SCROLL_EVERY":  (12, 25),
+        "SCROLL_BATCH_SIZE":     5,
+        "SCROLL_DISTANCE":       (300, 700),
+        "CONTENT_WAIT_TIMEOUT":  8.0,
+    },
+}
 
 SELECTORS = {
     "reviews_tab": [
@@ -173,166 +245,97 @@ SELECTORS = {
     ],
     "scroll_container": [
         'div[aria-label*="Reviews"][role="feed"]',
-        'div[jstcache][style*="overflow"]',
         '.m6QErb.DxyBCb.kA9KIf.dS8AEf',
+        'div[jstcache][style*="overflow"]',
         '.review-dialog-list',
     ],
-    "review_block": [
-        'div[data-review-id]',
-        'div[jsaction*="review"]',
-        '.jftiEf',
-        '.MyEned',
-    ],
-    "reviewer_name": [
-        '.d4r55',
-        '[class*="reviewer-name"]',
-        '.x3AX1-LfntMc-header-title-title span',
-    ],
-    "rating": [
-        'span[aria-label*="star"]',
-        '[role="img"][aria-label*="star"]',
-    ],
-    "review_text": [
-        '.MyEned span',
-        '.wiI7pd',
-        'span[class*="review-full-text"]',
-        '[jsaction*="expandReview"] span',
-    ],
-    "review_date": [
-        '.rsqaWe',
-        'span[class*="review-publish-date"]',
-        '.xRkPPb span',
-    ],
-    "more_button": [
-        'button[aria-label*="See more"]',
-        'button.w8nwRe',
-        'button:has-text("More")',
-    ],
     "captcha_signals": [
-        '#captcha',
-        'iframe[src*="recaptcha"]',
-        'form[action*="challenge"]',
-        'div[id*="challenge"]',
+        '#captcha', 'iframe[src*="recaptcha"]',
+        'form[action*="challenge"]', 'div[id*="challenge"]',
     ],
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOGGING
+# UTILITIES
 # ─────────────────────────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("scraper.log"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-log = logging.getLogger("GMapsReviews")
+def rand_delay(band): return random.uniform(*band)
+async def human_sleep(band): await asyncio.sleep(rand_delay(band))
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# UTILITY HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def review_id_hash(review_id: str) -> str:
-    return hashlib.sha1(review_id.encode()).hexdigest()
-
-
-def rand_delay(band: tuple) -> float:
-    lo, hi = band
-    return random.uniform(lo, hi)
-
-
-def jitter(base: float, pct: float = 0.2) -> float:
-    return base * random.uniform(1 - pct, 1 + pct)
-
-
-async def human_sleep(band: tuple):
-    await asyncio.sleep(rand_delay(band))
-
+def expansion_wait(reviews_scraped: int) -> float:
+    """
+    FIX A: Dynamic expansion wait.
+    Scales up as DOM gets deeper and Maps' renderer gets slower.
+    """
+    base  = CFG["EXPAND_WAIT_BASE"]
+    scale = CFG["EXPAND_WAIT_SCALE_PER_1K"] * (reviews_scraped / 1000)
+    return min(base + scale, CFG["EXPAND_WAIT_MAX"])
 
 async def micro_mouse_move(page: Page) -> bool:
-    """
-    Tiny random mouse movements to mimic human hand tremor.
-    Returns False if the page/browser has been closed (Wayland crash etc.)
-    so callers can react rather than crash.
-    """
     try:
-        for _ in range(random.randint(2, 5)):
-            x = random.randint(200, 900)
-            y = random.randint(150, 600)
-            await page.mouse.move(x, y, steps=random.randint(3, 8))
-            await asyncio.sleep(random.uniform(0.05, 0.18))
+        for _ in range(random.randint(2, 4)):
+            await page.mouse.move(
+                random.randint(200, 900), random.randint(150, 600),
+                steps=random.randint(3, 7)
+            )
+            await asyncio.sleep(random.uniform(0.04, 0.15))
         return True
-    except Exception as e:
-        log.warning(f"micro_mouse_move failed (browser may have closed): {e}")
+    except Exception:
         return False
 
-
-async def try_selector(page: Page, selectors: list, timeout: int = 5000) -> Optional[object]:
-    """Return first matching element across a list of CSS selectors."""
+async def try_selector(page, selectors, timeout=5000):
     for sel in selectors:
         try:
             el = await page.wait_for_selector(sel, timeout=timeout, state="visible")
-            if el:
-                return el
+            if el: return el
         except Exception:
             continue
     return None
 
-
 async def detect_captcha(page: Page) -> bool:
     for sel in SELECTORS["captcha_signals"]:
         try:
-            el = await page.query_selector(sel)
-            if el:
-                return True
+            if await page.query_selector(sel): return True
         except Exception:
             pass
     title = await page.title()
-    if "captcha" in title.lower() or "unusual traffic" in title.lower():
-        return True
-    return False
-
+    return "captcha" in title.lower() or "unusual traffic" in title.lower()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CSV STORAGE  (append-only, memory-safe)
+# CSV WRITER  (append-only, resume-safe, supports in-place row patching)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ReviewCSVWriter:
     FIELDS = [
-        "place_name", "reviewer_name", "rating",
-        "review_text", "owner_reply",
-        "likes", "date",
-        "dining_mode", "meal_type", "price_range",
-        "food_rating", "service_rating", "atmosphere_rating",
-        "extra_attributes",
+        "place_name", "reviewer_name", "reviewer_id", "local_guide",
+        "rating", "review_text", "likes", "date", "attributes",
     ]
 
     def __init__(self, filepath: str):
         self.filepath = filepath
         self.seen_ids: set = set()
+        self.empty_attr_ids: set = set()
+        # FIX: track write order so attribute fill pass knows card index
+        self.id_to_index: dict = {}   # review_id → row index (0-based, excl header)
         self._file = None
         self._writer = None
         self._load_existing()
 
-    @staticmethod
-    def _make_dedup_key(row: dict) -> str:
-        """Build a dedup key from the fields we actually store in CSV."""
-        return (row.get("reviewer_name", "") + "_" + row.get("date", "")).strip("_")
-
     def _load_existing(self):
-        """Pre-load dedup keys from existing CSV to support resumption."""
         if not Path(self.filepath).exists():
             return
         with open(self.filepath, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            for row in reader:
-                key = self._make_dedup_key(row)
-                if key:
-                    self.seen_ids.add(key)
-        log.info(f"Resumed — {len(self.seen_ids)} existing reviews loaded from {self.filepath}")
+            for i, row in enumerate(reader):
+                rid = row.get("review_id") or (
+                    row.get("reviewer_name", "") + "_" + row.get("date", "")
+                )
+                if rid:
+                    self.seen_ids.add(rid)
+                    self.id_to_index[rid] = i
+                    if not row.get("attributes", "").strip():
+                        self.empty_attr_ids.add(rid)
+        log.info(f"Resumed — {len(self.seen_ids)} existing | {len(self.empty_attr_ids)} missing attrs")
 
     def open(self):
         is_new = not Path(self.filepath).exists()
@@ -342,41 +345,273 @@ class ReviewCSVWriter:
             self._writer.writeheader()
 
     def write(self, review: dict) -> bool:
-        """Returns True if written (new), False if duplicate."""
-        rid = review.get("review_id") or self._make_dedup_key(review)
-        if not rid or rid in self.seen_ids:
+        """Append a new review row. Returns True if written."""
+        rid = review.get("review_id") or (
+            review.get("reviewer_name", "") + "_" + review.get("date", "")
+        )
+        if not rid:
             return False
+        has_attrs = bool(review.get("attributes", "").strip())
+        if rid in self.seen_ids and rid not in self.empty_attr_ids:
+            return False
+        if rid in self.seen_ids and rid in self.empty_attr_ids and not has_attrs:
+            return False
+
+        if rid not in self.id_to_index:
+            self.id_to_index[rid] = len(self.seen_ids)
         self.seen_ids.add(rid)
-        # Write only the defined fields, in order
         row = {f: review.get(f, "") for f in self.FIELDS}
         self._writer.writerow(row)
         self._file.flush()
+        if has_attrs:
+            self.empty_attr_ids.discard(rid)
+        else:
+            self.empty_attr_ids.add(rid)
         return True
 
+    def patch_attributes(self, review_id: str, attributes: str) -> bool:
+        """
+        FIX: In-place patch of a CSV row's attributes column.
+        Rewrites the entire CSV — acceptable because this runs in Phase 2
+        after all network writes are done, not during the hot write loop.
+        Returns True if the row was found and patched.
+        """
+        if not attributes or review_id not in self.empty_attr_ids:
+            return False
+
+        self._file.close()
+        self._file = None
+
+        path = Path(self.filepath)
+        tmp_path = path.with_suffix(".tmp")
+
+        patched = False
+        with open(path, newline="", encoding="utf-8") as fin, \
+             open(tmp_path, "w", newline="", encoding="utf-8") as fout:
+            reader = csv.DictReader(fin)
+            writer = csv.DictWriter(fout, fieldnames=self.FIELDS)
+            writer.writeheader()
+            for row in reader:
+                rid = row.get("review_id") or (
+                    row.get("reviewer_name", "") + "_" + row.get("date", "")
+                )
+                if rid == review_id and not row.get("attributes", "").strip():
+                    row["attributes"] = attributes
+                    patched = True
+                writer.writerow(row)
+
+        tmp_path.replace(path)
+
+        # Re-open for appending
+        self._file = open(path, "a", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._file, fieldnames=self.FIELDS)
+
+        if patched:
+            self.empty_attr_ids.discard(review_id)
+        return patched
+
     def close(self):
-        if self._file:
-            self._file.close()
+        if self._file: self._file.close()
 
     @property
-    def total_seen(self) -> int:
-        return len(self.seen_ids)
+    def total_seen(self): return len(self.seen_ids)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BROWSER SESSION MANAGEMENT
+# NETWORK INTERCEPTOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+class NetworkInterceptor:
+    RPC_PATTERNS = [
+        "listentitiesreviews",
+        "maps/api/js/reviews",
+        "GetReview",
+        "preview/review",
+    ]
+
+    def __init__(self):
+        self.captured_url: Optional[str] = None
+        self.captured_headers: dict = {}
+        self._lock = asyncio.Lock()
+
+    def matches(self, url: str) -> bool:
+        return any(p in url for p in self.RPC_PATTERNS)
+
+    async def on_request(self, request: Request):
+        if self.matches(request.url):
+            async with self._lock:
+                if not self.captured_url:
+                    self.captured_url = request.url
+                    self.captured_headers = dict(request.headers)
+                    log.info(f"[NET] INTERCEPTED: {request.url[:150]}")
+
+    def is_ready(self) -> bool:
+        return bool(self.captured_url)
+
+    def build_next_page_url(self, pagination_token: str) -> Optional[str]:
+        if not self.captured_url:
+            return None
+        return re.sub(r'(pb=)[^&]*', r'\g<1>' + pagination_token, self.captured_url)
+
+
+class NetworkReviewFetcher:
+    XSS_PREFIX = ")]}'"
+
+    def __init__(self, interceptor: NetworkInterceptor, session_cookies: str = ""):
+        self.interceptor = interceptor
+        self.session_cookies = session_cookies
+
+    @staticmethod
+    def _strip_xss(text: str) -> str:
+        text = text.strip()
+        if text.startswith(NetworkReviewFetcher.XSS_PREFIX):
+            text = text[len(NetworkReviewFetcher.XSS_PREFIX):]
+        return text.strip()
+
+    @staticmethod
+    def _deep_find_reviews(data, depth=0) -> list:
+        if depth > 10 or not isinstance(data, (list, dict)):
+            return []
+        results = []
+        if isinstance(data, list):
+            if 15 < len(data) < 100:
+                review = NetworkReviewFetcher._try_parse_review_array(data)
+                if review:
+                    results.append(review)
+                    return results
+            for item in data:
+                results.extend(NetworkReviewFetcher._deep_find_reviews(item, depth + 1))
+        return results
+
+    @staticmethod
+    def _try_parse_review_array(arr: list) -> Optional[dict]:
+        try:
+            strings, numbers = [], []
+
+            def flatten(x):
+                if isinstance(x, str) and len(x) > 0:
+                    strings.append(x)
+                elif isinstance(x, (int, float)):
+                    numbers.append(x)
+                elif isinstance(x, list):
+                    for item in x: flatten(item)
+
+            flatten(arr)
+            if not strings or not numbers:
+                return None
+
+            ratings = [n for n in numbers if 1 <= n <= 5]
+            if not ratings:
+                return None
+
+            review_id = reviewer_name = review_text = date_str = None
+            for s in strings:
+                if len(s) > 20 and re.match(r'^[A-Za-z0-9_\-]+$', s) and not review_id:
+                    review_id = s
+                elif len(s) > 3 and not reviewer_name and re.match(
+                        r'^[A-Za-z\s\u00C0-\u024F\u0900-\u097F]+$', s):
+                    reviewer_name = s
+                elif len(s) > 15 and not review_text:
+                    review_text = s
+
+            for s in strings:
+                if re.search(r'\d+\s+(day|week|month|year)s?\s+ago|just now|yesterday', s, re.I):
+                    date_str = s
+                    break
+
+            if not review_id:
+                return None
+
+            return {
+                "review_id":    review_id,
+                "reviewer_name": reviewer_name or "",
+                "reviewer_id":  "",
+                "local_guide":  False,
+                "rating":       ratings[0],
+                "review_text":  review_text or "",
+                "likes":        0,
+                "date":         date_str or "",
+                "attributes":   "",
+                "source":       "network",
+            }
+        except Exception:
+            return None
+
+    async def fetch_page(self, page: Page, url: str) -> tuple[list, Optional[str]]:
+        """Fetch one page of reviews. Retries up to NETWORK_MAX_RETRIES times."""
+        for attempt in range(CFG["NETWORK_MAX_RETRIES"]):
+            text = await self._fetch_raw(page, url)
+            if text:
+                break
+            wait = 2 ** attempt
+            log.warning(f"[NET] Retry {attempt+1}/{CFG['NETWORK_MAX_RETRIES']} in {wait}s")
+            await asyncio.sleep(wait)
+        else:
+            return [], None
+
+        text = self._strip_xss(text)
+        if not text:
+            return [], None
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            log.debug(f"[NET] JSON parse failed: {text[:200]}")
+            return [], None
+
+        reviews = self._deep_find_reviews(data)
+
+        next_token = None
+        if isinstance(data, list) and len(data) > 0:
+            last = data[-1]
+            if isinstance(last, str) and len(last) > 10:
+                next_token = last
+
+        log.info(f"[NET] Fetched {len(reviews)} reviews")
+        return reviews, next_token
+
+    async def _fetch_raw(self, page: Page, url: str) -> Optional[str]:
+        headers = dict(self.interceptor.captured_headers)
+        if self.session_cookies:
+            headers["cookie"] = self.session_cookies
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    if resp.status != 200:
+                        log.warning(f"[NET] HTTP {resp.status}")
+                        return None
+                    return await resp.text()
+        except ImportError:
+            try:
+                result = await page.evaluate("""
+                async (url) => {
+                    const r = await fetch(url, {credentials: 'include'});
+                    return {status: r.status, text: await r.text()};
+                }
+                """, url)
+                if result["status"] != 200:
+                    return None
+                return result["text"]
+            except Exception as e:
+                log.warning(f"[NET] page.evaluate fetch failed: {e}")
+                return None
+        except Exception as e:
+            log.warning(f"[NET] aiohttp fetch failed: {e}")
+            return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BROWSER SESSION
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BrowserSession:
-    def __init__(self, proxy: dict = None, session_dir: str = None, worker_id: int = 0):
-        """
-        proxy     : dict with keys 'server', optionally 'username'+'password'
-                    e.g. {"server": "http://host:port", "username": "u", "password": "p"}
-        session_dir: path to persistent profile directory. Each worker should
-                    have its own directory so cookies/identity don't collide.
-        worker_id : integer label used in log messages to identify this worker.
-        """
-        self.proxy      = proxy
-        self.worker_id  = worker_id
+    def __init__(self, proxy=None, session_dir=None, worker_id=0):
+        self.proxy       = proxy
+        self.worker_id   = worker_id
         self.session_dir = session_dir or CFG["SESSION_DIR"]
         os.makedirs(self.session_dir, exist_ok=True)
         self._playwright = None
@@ -386,8 +621,7 @@ class BrowserSession:
 
     async def start(self):
         self._playwright = await async_playwright().start()
-
-        launch_kwargs = dict(
+        kwargs = dict(
             user_data_dir=self.session_dir,
             headless=CFG["HEADLESS"],
             viewport={"width": CFG["VIEWPORT"][0], "height": CFG["VIEWPORT"][1]},
@@ -406,18 +640,11 @@ class BrowserSession:
             ],
             ignore_default_args=["--enable-automation"],
         )
-
-        # Inject proxy if provided
         if self.proxy:
-            launch_kwargs["proxy"] = self.proxy
-            log.info(f"[Worker {self.worker_id}] Using proxy: {self.proxy['server']}")
+            kwargs["proxy"] = self.proxy
 
-        # Persistent context reuses cookies/localStorage across runs
-        self.context = await self._playwright.chromium.launch_persistent_context(
-            **launch_kwargs
-        )
+        self.context = await self._playwright.chromium.launch_persistent_context(**kwargs)
 
-        # Override JS fingerprint markers
         await self.context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
@@ -430,145 +657,304 @@ class BrowserSession:
                     : orig(p);
         """)
 
-        # Apply stealth at context level first (covers ALL pages automatically)
-        if HAS_STEALTH and apply_stealth_context is not None:
-            try:
-                await apply_stealth_context(self.context)
-                log.info("Stealth applied at context level")
-            except Exception as e:
-                log.warning(f"Context-level stealth failed, falling back to page-level: {e}")
+        if HAS_STEALTH and apply_stealth_context:
+            try: await apply_stealth_context(self.context)
+            except Exception as e: log.warning(f"Context stealth failed: {e}")
 
         pages = self.context.pages
         self.page = pages[0] if pages else await self.context.new_page()
 
-        # Apply at page level (belt-and-suspenders, also covers page if context failed)
-        if HAS_STEALTH:
-            try:
-                await apply_stealth(self.page)
-                log.info("Stealth applied at page level")
-            except Exception as e:
-                log.warning(f"Page-level stealth failed: {e}")
+        if HAS_STEALTH and apply_stealth:
+            try: await apply_stealth(self.page)
+            except Exception as e: log.warning(f"Page stealth failed: {e}")
 
-        log.info("Browser session started (persistent context)")
+        log.info("Browser session started")
 
     async def stop(self):
-        if self.context:
-            await self.context.close()
-        if self._playwright:
-            await self._playwright.stop()
+        if self.context: await self.context.close()
+        if self._playwright: await self._playwright.stop()
         log.info("Browser session closed")
 
+    async def get_cookies_str(self) -> str:
+        try:
+            cookies = await self.context.cookies()
+            return "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+        except Exception:
+            return ""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REVIEW EXTRACTOR
+# REVIEW EXTRACTOR  (DOM mode)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# FIX B: The JS extractor now detects truncated attribute chips ("Dine in…")
+# and sets is_truncated=True for those cards, not just for truncated review text.
+# This feeds the existing 3-attempt retry correctly.
+
+_EXTRACT_JS = r"""
+(args) => {
+    const seenSet    = new Set(args.seenIds);
+    const emptySet   = new Set(args.emptyAttrIds);
+    const targetIds  = args.targetIds ? new Set(args.targetIds) : null;
+    const results    = [];
+
+    const allEls = document.querySelectorAll('[data-review-id]');
+    const blocks = [];
+    allEls.forEach(el => {
+        const rid = el.getAttribute('data-review-id') || '';
+        // If we have a target set, only extract those cards
+        if (targetIds && !targetIds.has(rid)) return;
+        // Skip if already fully written (has attrs)
+        if (rid && seenSet.has(rid) && !emptySet.has(rid)) return;
+        const parent = el.parentElement
+            ? el.parentElement.closest('[data-review-id]')
+            : null;
+        if (!parent) blocks.push(el);
+    });
+
+    if (blocks.length === 0 && !targetIds) {
+        document.querySelectorAll('div.jftiEf').forEach(el => blocks.push(el));
+    }
+
+    blocks.forEach(block => {
+        try {
+            const rid = block.getAttribute('data-review-id') || '';
+
+            const nameEl = block.querySelector('.d4r55, [class*="reviewer-name"]');
+            const name   = nameEl ? nameEl.innerText.trim() : '';
+            if (!rid && !name) return;
+
+            let reviewer_id = '';
+            const profileBtn = block.querySelector('button[data-href*="/maps/contrib/"]');
+            if (profileBtn) {
+                const m = (profileBtn.getAttribute('data-href') || '').match(/contrib[/](\d+)/);
+                if (m) reviewer_id = m[1];
+            }
+
+            const rfnDt = block.querySelector('.RfnDt');
+            const local_guide = rfnDt
+                ? rfnDt.innerText.trim().startsWith('Local Guide')
+                : false;
+
+            const ratingEl = block.querySelector('span[aria-label*="star"], [role="img"][aria-label*="star"]');
+            const ratingM  = (ratingEl ? ratingEl.getAttribute('aria-label') : '').match(/(\d+(\.\d+)?)/);
+            const rating   = ratingM ? parseFloat(ratingM[1]) : null;
+
+            const replyContainer = block.querySelector('.CDe7pd, .D1wvnb, div[jsname="BnxFpd"]');
+
+            let review_text = '';
+            const TEXT_SELS = ['span[jsname="bN97Pc"]', '.wiI7pd', '.MyEned span'];
+            for (const sel of TEXT_SELS) {
+                for (const el of block.querySelectorAll(sel)) {
+                    if (replyContainer && replyContainer.contains(el)) continue;
+                    const t = el.innerText.trim();
+                    if (t) { review_text = t; break; }
+                }
+                if (review_text) break;
+            }
+
+            const dateEl = block.querySelector('.rsqaWe, .xRkPPb span');
+            const date   = dateEl ? dateEl.innerText.trim() : '';
+
+            const likesEl = block.querySelector('button[aria-label*="helpful"] span, .pkWtMe');
+            let likes = 0;
+            if (likesEl) {
+                const lm = likesEl.innerText.trim().match(/(\d+)/);
+                likes = lm ? parseInt(lm[1]) : 0;
+            }
+
+            // ── ATTRIBUTES ──────────────────────────────────────────────────
+            const LABEL_MAP_A = {
+                'service': 'dining_mode', 'meal type': 'meal_type',
+                'price per person': 'price_per_person', 'wait time': 'wait_time',
+                'cleanliness': 'cleanliness', 'noise level': 'noise_level',
+                'parking space': 'parking_space', 'parking options': 'parking_options',
+                'parking': 'parking_notes', 'wheelchair accessibility': 'wheelchair_accessibility',
+                'group size': 'group_size', 'accessibility': 'accessibility',
+                'kids menu': 'kids_menu', 'kid-friendliness': 'kid_friendliness',
+                'children': 'children', 'reservations': 'reservations',
+                'amenities': 'amenities', 'recommended dishes': 'recommended_dishes',
+                'recommendation for vegetarians': 'vegetarian_recommendation',
+                'vegetarian offerings': 'vegetarian_offerings',
+                'vegetarian options': 'vegetarian_options',
+                'getting there': 'getting_there', 'planning': 'planning',
+                'service options': 'service_options', 'highlights': 'highlights',
+                'popular for': 'popular_for', 'offerings': 'offerings',
+                'dining options': 'dining_options', 'crowd': 'crowd',
+                'payments': 'payments', 'dine in': 'dining_mode',
+                'dine-in': 'dining_mode', 'seating type': 'seating_type',
+                'dietary restrictions': 'dietary_restrictions',
+                'special events': 'special_events', 'kid-friendly': 'kid_friendliness',
+                'noise': 'noise_level', 'restroom': 'restroom',
+                'dogs allowed': 'dogs_allowed', 'good for groups': 'good_for_groups',
+                'good for watching sports': 'good_for_sports',
+                'outdoor seating': 'outdoor_seating', 'live music': 'live_music',
+                'gender-neutral restrooms': 'gender_neutral_restrooms',
+                'accepts credit cards': 'accepts_credit_cards',
+                'delivery': 'delivery', 'takeaway': 'takeaway',
+            };
+            const LABEL_MAP_B = {
+                'food': 'food', 'service': 'service_rating', 'atmosphere': 'atmosphere',
+            };
+
+            const attrs = {};
+            // FIX B: track whether any chip value is still truncated
+            let any_chip_truncated = false;
+
+            block.querySelectorAll('div[jslog^="126926"]').forEach(pbk => {
+                if (replyContainer && replyContainer.contains(pbk)) return;
+
+                const boldEl = pbk.querySelector('b');
+                if (boldEl) {
+                    const rawLabel = boldEl.innerText.trim().replace(/:$/, '').toLowerCase();
+                    let val = '';
+                    boldEl.parentElement.childNodes.forEach(node => {
+                        if (node === boldEl) return;
+                        val += node.nodeType === Node.TEXT_NODE
+                            ? node.textContent
+                            : (node.innerText || node.textContent || '');
+                    });
+                    val = val.replace(/^[\s:]+/, '').trim();
+
+                    // FIX B: chip truncation detection
+                    if (val.endsWith('…') || val.endsWith('...')) {
+                        any_chip_truncated = true;
+                    }
+
+                    if (rawLabel && val && LABEL_MAP_B.hasOwnProperty(rawLabel)) {
+                        const key = LABEL_MAP_B[rawLabel];
+                        const num = parseFloat(val);
+                        if (!attrs[key]) attrs[key] = isNaN(num) ? val : num;
+                    }
+                } else {
+                    const divs = pbk.querySelectorAll(':scope > div');
+                    if (divs.length < 2) return;
+
+                    const boldSpan = divs[0].querySelector('span[style*="font-weight"]');
+                    if (!boldSpan) return;
+                    const rawLabel = boldSpan.innerText.trim().toLowerCase();
+
+                    const valueSpan = divs[1].querySelector('span.RfDO5c > span:first-child');
+                    if (!valueSpan) return;
+                    const val = valueSpan.innerText.trim();
+
+                    // FIX B: chip truncation detection
+                    if (val.endsWith('…') || val.endsWith('...')) {
+                        any_chip_truncated = true;
+                    }
+
+                    if (rawLabel && val && LABEL_MAP_A.hasOwnProperty(rawLabel)) {
+                        const key = LABEL_MAP_A[rawLabel];
+                        if (!attrs[key]) attrs[key] = val;
+                    }
+                }
+            });
+
+            const attributes = Object.keys(attrs).length > 0 ? JSON.stringify(attrs) : '';
+
+            // Truncation: check review text button AND chip truncation
+            const truncated_btn = block.querySelector('button.w8nwRe:not([aria-expanded="true"])');
+            const is_truncated  = (
+                truncated_btn !== null ||
+                review_text.endsWith('…') ||
+                review_text.endsWith('...') ||
+                any_chip_truncated  // FIX B: this was the missing check
+            );
+
+            results.push({
+                review_id:     rid || (name + '_' + date),
+                reviewer_name: name,
+                reviewer_id:   reviewer_id,
+                local_guide:   local_guide,
+                rating:        rating,
+                review_text:   review_text.replace(/[\r\n]+/g, ' ').trim(),
+                likes:         likes,
+                date:          date,
+                attributes:    attributes,
+                is_truncated:  is_truncated,
+            });
+
+        } catch(e) {}
+    });
+
+    return results;
+}
+"""
+
+_EXPAND_JS = """
+(args) => {
+    const alreadyClicked = new Set(args.alreadyClicked);
+    const targetIds      = args.targetIds ? new Set(args.targetIds) : null;
+    const clicked = [];
+
+    const candidates = document.querySelectorAll(
+        'button.w8nwRe, button[aria-label*="See more"], button[aria-label*="see more"]'
+    );
+    const BLOCK_WORDS = ['photo','flag','report','helpful','share','translate','like',
+                         'contributor','profile'];
+
+    candidates.forEach(btn => {
+        if (btn.getAttribute('aria-expanded') === 'true') return;
+        if (!btn.offsetParent) return;
+
+        const lbl = (btn.getAttribute('aria-label') || '').toLowerCase();
+        for (const w of BLOCK_WORDS) { if (lbl.includes(w)) return; }
+
+        let el = btn.parentElement;
+        let card_id = null;
+        for (let i = 0; i < 20 && el; i++) {
+            card_id = el.getAttribute('data-review-id');
+            if (card_id) break;
+            el = el.parentElement;
+        }
+        if (!card_id) return;
+        if (targetIds && !targetIds.has(card_id)) return;
+
+        const jsaction = btn.getAttribute('jsaction') || btn.className || 'btn';
+        const key = card_id + '::' + jsaction;
+        if (alreadyClicked.has(key)) return;
+
+        try { btn.click(); clicked.push(key); } catch(e) {}
+    });
+
+    return clicked;
+}
+"""
+
 
 class ReviewExtractor:
-    """Extracts review data from currently visible DOM nodes."""
+    def __init__(self):
+        self._expanded_buttons: set = set()
 
-    @staticmethod
-    async def _is_safe_more_button(page: Page, btn) -> bool:
+    async def expand_truncated(self, page: Page,
+                                reviews_scraped: int = 0,
+                                target_ids: list = None) -> int:
         """
-        Returns True if this button is a review text expand button.
-        Uses JS DOM walk to check for danger signals — same block-list logic
-        as before, but now called per-button from Python so we can use
-        Playwright's native .click() instead of JS btn.click().
+        Click all unexpanded 'More' buttons.
+        FIX A: wait time scales with reviews_scraped depth.
+        target_ids: if set, only expand buttons inside those specific cards.
         """
-        try:
-            return await page.evaluate(r"""
-            (btn) => {
-                const BLOCK_ARIA = [
-                    'photo', 'flag', 'report', 'helpful',
-                    'share', 'translate', 'like'
-                ];
-                // Block by the button's own aria-label
-                const btnLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
-                for (const word of BLOCK_ARIA) {
-                    if (btnLabel.includes(word)) return false;
-                }
-                // Walk up DOM looking for danger signals
-                let el = btn.parentElement;
-                let depth = 0;
-                while (el && depth < 12) {
-                    const label = (el.getAttribute('aria-label') || '').toLowerCase();
-                    const cls   = (el.className || '').toLowerCase();
-                    if (el.tagName === 'A')                    return false;
-                    if (label.includes('contributor'))         return false;
-                    if (label.includes('profile'))             return false;
-                    if (cls.includes('contrib'))               return false;
-                    if (el.hasAttribute('data-review-id'))     break;
-                    el = el.parentElement;
-                    depth++;
-                }
-                return true;
-            }
-            """, btn)
-        except Exception:
-            return False
+        total_clicked = 0
+        for _pass in range(4):
+            already = list(self._expanded_buttons)
+            clicked_keys = await page.evaluate(_EXPAND_JS, {
+                "alreadyClicked": already,
+                "targetIds": target_ids,
+            })
+            if not clicked_keys:
+                break
+            for k in clicked_keys:
+                self._expanded_buttons.add(k)
+            total_clicked += len(clicked_keys)
 
-    @staticmethod
-    async def expand_truncated(page: Page):
-        """
-        Click all 'More' / 'See more' buttons using Playwright's native
-        .click() method, then wait for each button to disappear before
-        moving on — guaranteeing the full text is in the DOM before we
-        extract.
+            # FIX A: dynamic wait — deeper = slower Maps renderer = longer wait
+            wait = expansion_wait(reviews_scraped) if _pass == 0 else 0.3
+            await asyncio.sleep(wait)
 
-        Why Playwright .click() instead of JS btn.click():
-          JS btn.click() only fires the 'click' event.
-          Google Maps buttons need mousedown → mouseup → click in sequence
-          to trigger their React event handlers and load the full text.
-          Playwright's .click() fires all three correctly.
-
-        Why wait for button to disappear:
-          After a successful expand, Google removes the 'More' button from
-          the DOM and replaces it with the full text. Waiting for it to
-          detach confirms the text is loaded before we extract.
-        """
-        try:
-            # Query all candidate buttons from Python side
-            buttons = await page.query_selector_all(
-                'button[aria-label*="See more"], '
-                'button[aria-label*="see more"], '
-                'button.w8nwRe'
-            )
-
-            for btn in buttons:
-                try:
-                    # Safety check — skip profile links and action buttons
-                    if not await ReviewExtractor._is_safe_more_button(page, btn):
-                        continue
-
-                    # Check button is still visible (virtualised list may
-                    # have recycled it since we queried)
-                    is_visible = await btn.is_visible()
-                    if not is_visible:
-                        continue
-
-                    # Playwright native click — fires full mouse event sequence
-                    await btn.click(timeout=3000)
-
-                    # Wait for the button to disappear from DOM.
-                    # This is the signal that Google has injected the full text.
-                    # Timeout of 3s — if it doesn't disappear, text may already
-                    # have been expanded or the click didn't register.
-                    try:
-                        await btn.wait_for_element_state("hidden", timeout=3000)
-                    except Exception:
-                        pass  # button may already be gone or text was short
-
-                    # Small pause between clicks — avoid hammering the UI
-                    await asyncio.sleep(random.uniform(0.1, 0.25))
-
-                except Exception:
-                    continue  # stale handle or invisible — skip silently
-
-        except Exception:
-            pass
+        return total_clicked
 
     @staticmethod
     async def get_place_name(page: Page) -> str:
-        """Extract the place/business name from the listing header."""
         try:
             name = await page.evaluate(r"""
             () => {
@@ -583,34 +969,16 @@ class ReviewExtractor:
 
     @staticmethod
     async def get_total_review_count(page: Page) -> int:
-        """
-        Read the total review count shown in the listing header (e.g. '915 reviews' -> 915).
-        Used to detect when we are near the end and can stop early.
-        Returns 0 if not parseable.
-        """
         try:
             count = await page.evaluate(r"""
             () => {
-                // Try the reviews tab button aria-label first: "1,234 reviews"
-                const btns = document.querySelectorAll(
-                    'button[jsaction*="reviews"], [aria-label*="reviews"]'
-                );
+                const btns = document.querySelectorAll('button[jsaction*="reviews"], [aria-label*="reviews"]');
                 for (const btn of btns) {
                     const lbl = (btn.getAttribute('aria-label') || '').replace(/,/g, '');
                     const m = lbl.match(/(\d+)\s+reviews?/i);
                     if (m) return parseInt(m[1]);
                 }
-                // Rating block span
-                const spans = document.querySelectorAll('span[aria-label]');
-                for (const s of spans) {
-                    const lbl = (s.getAttribute('aria-label') || '').replace(/,/g, '');
-                    const m = lbl.match(/(\d+)\s+reviews?/i);
-                    if (m) return parseInt(m[1]);
-                }
-                // Text node scan
-                const walker = document.createTreeWalker(
-                    document.body, NodeFilter.SHOW_TEXT
-                );
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
                 let node;
                 while ((node = walker.nextNode())) {
                     const m = node.textContent.replace(/,/g,'').match(/(\d{2,})\s+reviews?/i);
@@ -623,191 +991,22 @@ class ReviewExtractor:
         except Exception:
             return 0
 
-    @staticmethod
-    async def extract_visible(page: Page, seen_ids: set, place_name: str) -> list[dict]:
-        """
-        Extract all visible review blocks.
-        
-        Key design: we find the OUTERMOST data-review-id element for each review.
-        Nested divs may also have data-review-id, so we filter to only top-level
-        ones (those not contained inside another data-review-id). This guarantees
-        block.innerText contains ALL content for that review — text, attributes,
-        sub-ratings — with no cross-contamination between reviews.
-        """
-        await ReviewExtractor.expand_truncated(page)
-
-        raw = await page.evaluate(r"""
-        () => {
-            // Get ALL elements with data-review-id
-            const allReviewEls = document.querySelectorAll('[data-review-id]');
-
-            // Keep only OUTERMOST ones — skip any that are nested inside another
-            const blocks = [];
-            allReviewEls.forEach(el => {
-                const parent = el.parentElement
-                    ? el.parentElement.closest('[data-review-id]')
-                    : null;
-                if (!parent) blocks.push(el);  // no ancestor with data-review-id = outermost
-            });
-
-            // Fallback: if no data-review-id elements found use class selectors
-            if (blocks.length === 0) {
-                document.querySelectorAll('div.jftiEf').forEach(el => blocks.push(el));
-            }
-
-            const results = [];
-
-            blocks.forEach(block => {
-                try {
-                    // ── dedup key ──
-                    const rid = block.getAttribute('data-review-id') || '';
-
-                    // ── reviewer name ──
-                    const nameEl = block.querySelector(
-                        '.d4r55, [class*="reviewer-name"], .x3AX1-LfntMc-header-title-title span'
-                    );
-                    const name = nameEl ? nameEl.innerText.trim() : '';
-                    if (!rid && !name) return;
-
-                    // ── overall star rating ──
-                    const ratingEl = block.querySelector(
-                        'span[aria-label*="star"], [role="img"][aria-label*="star"]'
-                    );
-                    const ratingLabel = ratingEl ? ratingEl.getAttribute('aria-label') : '';
-                    const ratingMatch = ratingLabel.match(/(\d+(\.\d+)?)/);
-                    const rating = ratingMatch ? parseFloat(ratingMatch[1]) : null;
-
-                    // ── customer review text ──
-                    const textEl = block.querySelector(
-                        '.MyEned span, .wiI7pd, span[jsname="bN97Pc"]'
-                    );
-                    const review_text = textEl ? textEl.innerText.trim() : '';
-
-                    // ── owner reply ──
-                    let owner_reply = '';
-                    const replyEls = block.querySelectorAll(
-                        '.CDe7pd, div[class*="owner-response"], div[aria-label*="response"]'
-                    );
-                    replyEls.forEach(el => {
-                        if (!owner_reply) owner_reply = el.innerText.trim();
-                    });
-
-                    // ── date ──
-                    const dateEl = block.querySelector(
-                        '.rsqaWe, span[class*="review-publish-date"], .xRkPPb span'
-                    );
-                    const date = dateEl ? dateEl.innerText.trim() : '';
-
-                    // ── likes ──
-                    const likesEl = block.querySelector(
-                        'button[aria-label*="helpful"] span, .pkWtMe, .GBkF3d span'
-                    );
-                    let likes = 0;
-                    if (likesEl) {
-                        const lm = likesEl.innerText.trim().match(/(\d+)/);
-                        likes = lm ? parseInt(lm[1]) : 0;
-                    }
-
-                    // ── attributes + sub-ratings ──
-                    // Read from block.innerText ONLY — never go above the block.
-                    // The outermost data-review-id div contains everything for
-                    // this one review. No sibling/parent walking needed.
-                    let dining_mode = '';
-                    let meal_type = '';
-                    let price_range = '';
-                    let food_rating = '';
-                    let service_rating = '';
-                    let atmosphere_rating = '';
-                    const extra = {};
-
-                    // Split into clean deduplicated lines
-                    const seen_lines = new Set();
-                    const lines = block.innerText
-                        .split('\n')
-                        .map(s => s.trim())
-                        .filter(s => {
-                            if (!s || seen_lines.has(s)) return false;
-                            seen_lines.add(s);
-                            return true;
-                        });
-
-                    // Pattern A — sub-ratings: "Food: 3", "Service: 4", "Atmosphere: 5"
-                    // Format: Label + ": " + single digit 1-5 (nothing else on the line)
-                    const subRatingRe = /^(.+?):\s*([1-5])$/;
-                    const consumed = new Set();
-
-                    lines.forEach((line, idx) => {
-                        const m = line.match(subRatingRe);
-                        if (!m) return;
-                        const lbl = m[1].trim().toLowerCase();
-                        const val = parseFloat(m[2]);
-                        consumed.add(idx);
-                        if      (lbl === 'food')        food_rating = val;
-                        else if (lbl === 'service')     service_rating = val;
-                        else if (lbl === 'atmosphere')  atmosphere_rating = val;
-                        else                            extra[lbl] = val;
-                    });
-
-                    // Pattern B — categorical: label line followed by value line
-                    // "Service" -> "Dine in"
-                    // "Meal type" -> "Lunch"
-                    // "Price per person" -> "₹200–400"
-                    for (let i = 0; i < lines.length - 1; i++) {
-                        if (consumed.has(i) || consumed.has(i + 1)) continue;
-                        const lbl = lines[i].toLowerCase().trim();
-                        const val = lines[i + 1].trim();
-
-                        // reject long sentences (review text, not attribute values)
-                        if (val.length > 60) continue;
-                        // reject sub-rating lines as values
-                        if (/:\s*[1-5]$/.test(val)) continue;
-
-                        if (!meal_type && lbl === 'meal type') {
-                            meal_type = val;
-                            consumed.add(i); consumed.add(i + 1);
-                        } else if (!dining_mode && lbl === 'service') {
-                            // bare "Service" label = dining mode category
-                            // (vs "Service: 1" which is a sub-rating, caught by Pattern A)
-                            dining_mode = val;
-                            consumed.add(i); consumed.add(i + 1);
-                        } else if (!dining_mode && lbl.includes('dine')) {
-                            dining_mode = val;
-                            consumed.add(i); consumed.add(i + 1);
-                        } else if (!price_range && lbl.includes('price per person')) {
-                            price_range = val;
-                            consumed.add(i); consumed.add(i + 1);
-                        }
-                    }
-
-                    const extra_attributes = Object.keys(extra).length > 0
-                        ? JSON.stringify(extra) : '';
-
-                    results.push({
-                        review_id:         rid || (name + '_' + date),
-                        reviewer_name:     name,
-                        rating:            rating,
-                        review_text:       review_text,
-                        owner_reply:       owner_reply,
-                        likes:             likes,
-                        date:              date,
-                        dining_mode:       dining_mode,
-                        meal_type:         meal_type,
-                        price_range:       price_range,
-                        food_rating:       food_rating,
-                        service_rating:    service_rating,
-                        atmosphere_rating: atmosphere_rating,
-                        extra_attributes:  extra_attributes,
-                    });
-
-                } catch(e) {}
-            });
-            return results;
-        }
-        """)
-
+    async def extract_visible(self, page: Page, seen_ids: set, place_name: str,
+                               empty_attr_ids: set = None,
+                               target_ids: list = None) -> list:
+        empty_attr_ids = empty_attr_ids or set()
+        raw = await page.evaluate(_EXTRACT_JS, {
+            "seenIds": list(seen_ids),
+            "emptyAttrIds": list(empty_attr_ids),
+            "targetIds": target_ids,
+        })
         new_reviews = []
         for r in raw:
-            if r["review_id"] not in seen_ids:
+            rid = r["review_id"]
+            if rid not in seen_ids:
+                r["place_name"] = place_name
+                new_reviews.append(r)
+            elif rid in empty_attr_ids and r.get("attributes", "").strip():
                 r["place_name"] = place_name
                 new_reviews.append(r)
         return new_reviews
@@ -818,101 +1017,104 @@ class ReviewExtractor:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ScrollEngine:
-    """
-    Infinite scroll manager for Google Maps review panel.
-    Handles virtualized lists where old DOM nodes are recycled.
-    """
-
     def __init__(self, page: Page):
-        self.page = page
-        self.scroll_count = 0
+        self.page          = page
+        self.scroll_count  = 0
         self.plateau_count = 0
-        self.next_idle_at = random.randint(*CFG["IDLE_PAUSE_EVERY"])
-        self.next_reverse_at = random.randint(*CFG["REVERSE_SCROLL_EVERY"])
+        self.next_idle_at  = random.randint(*CFG["IDLE_PAUSE_EVERY"])
+        self.next_rev_at   = random.randint(*CFG["REVERSE_SCROLL_EVERY"])
 
-    async def find_scroll_container(self) -> Optional[object]:
+    async def find_scroll_container(self):
         for sel in SELECTORS["scroll_container"]:
             try:
                 el = await self.page.query_selector(sel)
                 if el:
-                    log.debug(f"Scroll container found via: {sel}")
+                    log.debug(f"Scroll container: {sel}")
                     return el
             except Exception:
                 continue
-        log.warning("Scroll container not found — falling back to window scroll")
+        log.warning("Scroll container not found — using window scroll")
         return None
 
     async def scroll_once(self, container) -> int:
-        """
-        Scroll down by a randomised distance.
-        Returns pixel distance scrolled.
-        """
         lo, hi = CFG["SCROLL_DISTANCE"]
-        distance = random.randint(lo, hi)
-        # instant scroll = no animation delay; 'smooth' wastes ~400ms per scroll
-        behavior = "instant" if CFG.get("SCROLL_JUMP", True) else "smooth"
-
+        dist   = random.randint(lo, hi)
+        beh    = "instant" if CFG.get("SCROLL_JUMP") else "smooth"
         if container:
             await self.page.evaluate(
-                """([el, dist, beh]) => { el.scrollBy({top: dist, behavior: beh}); }""",
-                [container, distance, behavior]
+                "([el,d,b]) => el.scrollBy({top:d,behavior:b})", [container, dist, beh]
             )
         else:
-            await self.page.evaluate(
-                f"window.scrollBy({{top: {distance}, behavior: '{behavior}'}})"
-            )
-
+            await self.page.evaluate(f"window.scrollBy({{top:{dist},behavior:'{beh}'}})")
         self.scroll_count += 1
-        return distance
+        return dist
 
-    async def reverse_scroll(self, container):
-        """Small back-scroll to mimic human re-reading behaviour."""
-        dist = random.randint(80, 220)
-        beh = "instant" if CFG.get("SCROLL_JUMP", True) else "smooth"
+    async def jump_to_index(self, container, card_index: int):
+        """
+        Jump the scroll container to approximately the position of card_index.
+        Used in the attribute fill pass to avoid scrolling through all 52k reviews.
+        """
+        approx_px = card_index * CFG["APPROX_CARD_HEIGHT_PX"]
         if container:
             await self.page.evaluate(
-                """([el, dist, beh]) => { el.scrollBy({top: -dist, behavior: beh}); }""",
-                [container, dist, beh]
+                "([el, px]) => { el.scrollTop = px; }",
+                [container, max(0, approx_px - 400)]  # slight overshoot-back
+            )
+        await asyncio.sleep(0.5)
+
+    async def reverse_scroll(self, container):
+        dist = random.randint(80, 220)
+        beh  = "instant" if CFG.get("SCROLL_JUMP") else "smooth"
+        if container:
+            await self.page.evaluate(
+                "([el,d,b]) => el.scrollBy({top:-d,behavior:b})", [container, dist, beh]
             )
         await asyncio.sleep(random.uniform(0.1, 0.3))
         fwd = dist + random.randint(150, 350)
         if container:
             await self.page.evaluate(
-                """([el, dist, beh]) => { el.scrollBy({top: dist, behavior: beh}); }""",
-                [container, fwd, beh]
+                "([el,d,b]) => el.scrollBy({top:d,behavior:b})", [container, fwd, beh]
             )
 
     async def wait_for_new_content(self, prev_count: int, timeout: float = None) -> int:
-        """
-        Poll DOM until new review nodes appear or timeout.
-        Returns count of new nodes found.
-        """
-        if timeout is None:
-            timeout = CFG["CONTENT_WAIT_TIMEOUT"]
-        poll = CFG["CONTENT_WAIT_POLL"]
+        timeout = timeout or CFG["CONTENT_WAIT_TIMEOUT"]
+        poll    = CFG["CONTENT_WAIT_POLL"]
         deadline = time.time() + timeout
         while time.time() < deadline:
             count = await self.page.evaluate(
-                "() => document.querySelectorAll('div[data-review-id], div.jftiEf').length"
+                "() => document.querySelectorAll('div[data-review-id],div.jftiEf').length"
             )
             if count > prev_count:
                 return count - prev_count
             await asyncio.sleep(poll)
         return 0
 
+    async def wait_for_card(self, rid: str, timeout: float = None) -> bool:
+        """Wait until a specific review card (by review_id) appears in DOM."""
+        timeout = timeout or CFG["ATTR_FILL_CARD_WAIT"]
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            found = await self.page.evaluate(
+                "(rid) => !!document.querySelector(`[data-review-id='${rid}']`)",
+                rid
+            )
+            if found:
+                return True
+            await asyncio.sleep(0.15)
+        return False
+
     async def maybe_idle_pause(self):
         if self.scroll_count >= self.next_idle_at:
             pause = rand_delay(CFG["DELAY_IDLE_PAUSE"])
-            log.info(f"  [Human simulation] Idle pause for {pause:.1f}s")
+            log.info(f"  [idle pause] {pause:.1f}s")
             await micro_mouse_move(self.page)
             await asyncio.sleep(pause)
             self.next_idle_at = self.scroll_count + random.randint(*CFG["IDLE_PAUSE_EVERY"])
 
     async def maybe_reverse_scroll(self, container):
-        if self.scroll_count >= self.next_reverse_at:
-            log.debug("  [Human simulation] Reverse scroll")
+        if self.scroll_count >= self.next_rev_at:
             await self.reverse_scroll(container)
-            self.next_reverse_at = self.scroll_count + random.randint(*CFG["REVERSE_SCROLL_EVERY"])
+            self.next_rev_at = self.scroll_count + random.randint(*CFG["REVERSE_SCROLL_EVERY"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -921,44 +1123,30 @@ class ScrollEngine:
 
 class AntiBlockManager:
     def __init__(self, page: Page):
-        self.page = page
-        self.slow_mode = False
+        self.page            = page
+        self.slow_mode       = False
         self.slow_mode_count = 0
 
     async def check(self) -> str:
-        """Returns 'ok', 'slow', or 'captcha'."""
-        if await detect_captcha(self.page):
-            return "captcha"
-
-        # Soft-ban signals: empty content, redirect, error overlays
+        if await detect_captcha(self.page): return "captcha"
         url = self.page.url
-        if "sorry" in url or "challenge" in url or "consent" in url:
-            return "captcha"
-
-        # Check if reviews panel went blank (content blocked)
-        review_count = await self.page.evaluate("""
-            () => document.querySelectorAll('div[data-review-id], div.jftiEf').length
-        """)
-        if review_count == 0 and self.slow_mode_count > 3:
-            return "slow"
-
+        if any(p in url for p in ["sorry", "challenge", "consent"]): return "captcha"
+        count = await self.page.evaluate(
+            "() => document.querySelectorAll('div[data-review-id],div.jftiEf').length"
+        )
+        if count == 0 and self.slow_mode_count > 3: return "slow"
         return "ok"
 
     async def handle_captcha(self):
-        log.warning("⚠️  CAPTCHA detected — pausing for manual solve")
-        log.warning(f"   Solve the CAPTCHA in the browser window within {CFG['CAPTCHA_PAUSE']}s")
+        log.warning(f"⚠️  CAPTCHA — pausing {CFG['CAPTCHA_PAUSE']}s for manual solve")
         await asyncio.sleep(CFG["CAPTCHA_PAUSE"])
-        # After pause, check if resolved
         if await detect_captcha(self.page):
-            log.error("CAPTCHA not solved — aborting")
             raise RuntimeError("CAPTCHA unsolved after pause")
 
     async def apply_slow_mode(self):
-        self.slow_mode = True
         self.slow_mode_count += 1
         delay = rand_delay(CFG["SLOW_MODE_DELAY"])
-        log.warning(f"⚠️  Soft-ban signal — slow mode delay {delay:.1f}s "
-                    f"(incident #{self.slow_mode_count})")
+        log.warning(f"⚠️  Soft-ban signal — slow mode {delay:.1f}s (#{self.slow_mode_count})")
         await asyncio.sleep(delay)
 
 
@@ -968,140 +1156,78 @@ class AntiBlockManager:
 
 class GoogleMapsReviewScraper:
     def __init__(self, url: str, output_csv: str,
-                 proxy: dict = None, session_dir: str = None, worker_id: int = 0):
-        self.url = url
-        # Only construct a CSV writer if a path is given.
-        # When used inside a parallel worker, the shared ReviewCSVWriter
-        # is injected after construction (scraper.csv = shared_writer),
-        # so we must not crash trying to open an empty path here.
-        self.csv = ReviewCSVWriter(output_csv) if output_csv else None
-        self.session = BrowserSession(
-            proxy=proxy,
-            session_dir=session_dir,
-            worker_id=worker_id,
-        )
-        self.worker_id   = worker_id
-        self._shutdown   = False
+                 proxy=None, session_dir=None, worker_id=0, mode="hybrid"):
+        self.url       = url
+        self.mode      = mode
+        self.csv       = ReviewCSVWriter(output_csv) if output_csv else None
+        self.session   = BrowserSession(proxy=proxy, session_dir=session_dir, worker_id=worker_id)
+        self.worker_id = worker_id
+        self._shutdown = False
         self._start_time = None
-        self._last_written = 0  # reviews written in last scrape session
+        self._truncation_attempts: dict = {}
 
     def _register_signals(self):
-        """Handle Ctrl+C / SIGTERM gracefully."""
-        def _handler(sig, frame):
-            log.info("\n🛑  Shutdown signal received — finishing current batch...")
+        def _h(sig, frame):
+            log.info("🛑  Shutdown signal — finishing batch...")
             self._shutdown = True
-        signal.signal(signal.SIGINT, _handler)
-        signal.signal(signal.SIGTERM, _handler)
+        signal.signal(signal.SIGINT, _h)
+        signal.signal(signal.SIGTERM, _h)
 
     def _runtime_exceeded(self) -> bool:
         return (time.time() - self._start_time) > CFG["MAX_RUNTIME_SECONDS"]
 
-    # ── Phase 1: Navigate to listing ─────────────────────────────────────────
-
     @staticmethod
     async def _dismiss_consent(page: Page):
-        """
-        Dismiss Google consent / cookie wall that appears on first visit
-        from a new IP or region. Must be handled before any Maps page loads.
-        """
-        try:
-            consent_selectors = [
-                'button[aria-label*="Accept all"]',
-                'button:has-text("Accept all")',
-                'button:has-text("I agree")',
-                'button:has-text("Agree")',
-                'form[action*="consent"] button',
-                '#L2AGLb',   # Google's "I agree" button id
-            ]
-            for sel in consent_selectors:
-                try:
-                    btn = await page.wait_for_selector(sel, timeout=3000, state="visible")
-                    if btn:
-                        await btn.click()
-                        log.info("  Consent wall dismissed")
-                        await asyncio.sleep(1.5)
-                        return
-                except Exception:
-                    continue
-        except Exception:
-            pass
+        for sel in [
+            'button[aria-label*="Accept all"]', 'button:has-text("Accept all")',
+            'button:has-text("I agree")', 'button:has-text("Agree")',
+            'form[action*="consent"] button', '#L2AGLb',
+        ]:
+            try:
+                btn = await page.wait_for_selector(sel, timeout=3000, state="visible")
+                if btn:
+                    await btn.click()
+                    await asyncio.sleep(1.5)
+                    return
+            except Exception:
+                continue
 
     async def _navigate(self, page: Page):
-        # Append language/region params to force English + India context
-        # regardless of proxy IP location
         url = self.url
         sep = "&" if "?" in url else "?"
-        if "hl=" not in url:
-            url = url + sep + "hl=en"
-            sep = "&"
-        if "gl=" not in url:
-            url = url + sep + "gl=in"
-
-        log.info(f"Navigating to: {url}")
+        if "hl=" not in url: url += sep + "hl=en"; sep = "&"
+        if "gl=" not in url: url += sep + "gl=in"
 
         for attempt in range(4):
             try:
-                # Step 1: warm up with plain maps.google.com first on first attempt
-                # This sets cookies and handles consent before the real page load
                 if attempt == 0:
                     try:
-                        await page.goto(
-                            "https://www.google.com/maps?hl=en&gl=in",
-                            wait_until="domcontentloaded",
-                            timeout=30000
-                        )
+                        await page.goto("https://www.google.com/maps?hl=en&gl=in",
+                                        wait_until="domcontentloaded", timeout=30000)
                         await asyncio.sleep(rand_delay((1.5, 3.0)))
                         await self._dismiss_consent(page)
-                        await asyncio.sleep(rand_delay((1.0, 2.0)))
                     except Exception:
-                        pass  # warm-up failure is non-fatal
-
-                # Step 2: navigate to actual listing
+                        pass
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-
-                # Dismiss consent if it appeared on this page
                 await self._dismiss_consent(page)
-
-                # Verify page actually loaded
-                current_url = page.url
-                if "about:blank" in current_url or not current_url.startswith("http"):
-                    raise PWTimeout("Page loaded blank — proxy may not be connected")
-
-                # Verify it's actually a Maps page
-                if "google.com/maps" not in current_url and "maps.google" not in current_url:
-                    log.warning(f"  Unexpected redirect to: {current_url[:80]}")
-                    # May have been redirected to consent or country page
-                    await self._dismiss_consent(page)
-                    # Try navigating again
-                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    await self._dismiss_consent(page)
-
+                if "about:blank" in page.url:
+                    raise PWTimeout("Blank page loaded")
                 await asyncio.sleep(rand_delay((2.0, 4.0)))
                 return
-
-            except PWTimeout:
-                wait = 5 * (attempt + 1)
-                log.warning(f"Navigation timeout (attempt {attempt+1}/4) — waiting {wait}s")
-                await asyncio.sleep(wait)
             except Exception as e:
-                log.warning(f"Navigation error (attempt {attempt+1}/4): {e}")
-                await asyncio.sleep(5)
-
-        raise RuntimeError("Failed to load listing page after 4 attempts")
-
-    # ── Phase 2: Open reviews tab ─────────────────────────────────────────────
+                log.warning(f"Navigation attempt {attempt+1}/4: {e}")
+                await asyncio.sleep(5 * (attempt + 1))
+        raise RuntimeError("Failed to navigate after 4 attempts")
 
     async def _open_reviews_tab(self, page: Page):
         log.info("Opening Reviews tab...")
         tab = await try_selector(page, SELECTORS["reviews_tab"], timeout=10000)
         if not tab:
-            raise RuntimeError("Reviews tab not found — page structure may have changed")
-
+            raise RuntimeError("Reviews tab not found")
         await micro_mouse_move(page)
         await tab.click()
         await human_sleep(CFG["DELAY_AFTER_CLICK"])
 
-        # Sort by Newest for consistent ordering
         sort_btn = await try_selector(page, SELECTORS["review_sort_button"], timeout=6000)
         if sort_btn:
             await sort_btn.click()
@@ -1111,110 +1237,264 @@ class GoogleMapsReviewScraper:
                 await newest.click()
                 await asyncio.sleep(rand_delay((1.5, 3.0)))
                 log.info("Sorted by Newest")
-            else:
-                log.warning("Newest sort option not found — proceeding with default order")
-        else:
-            log.warning("Sort button not found — proceeding with default order")
 
-    # ── Phase 3: Core scroll + extract loop ──────────────────────────────────
-
-    def _is_valid_listing_url(self, url: str) -> bool:
-        """
-        Returns True only if the current page URL is still our target listing.
-        Rejects: contributor profiles, search pages, consent pages, other places.
-        """
-        BAD_PATTERNS = [
-            "/contrib/",        # reviewer profile pages  ← the bug you hit
-            "/search",          # search results page
-            "consent.google",   # consent/cookie wall
-            "/sorry",           # rate limit page
-            "challenge",        # captcha challenge
-        ]
-        for pat in BAD_PATTERNS:
-            if pat in url:
-                return False
-        # Must still contain the place path
+    def _is_valid_url(self, url: str) -> bool:
+        for bad in ["/contrib/", "/search", "consent.google", "/sorry", "challenge"]:
+            if bad in url: return False
         return "/maps/place/" in url
 
-    async def _recover_to_listing(self, page: Page, original_url: str) -> bool:
-        """Navigate back to original listing and re-open the reviews panel."""
-        log.warning(f"  URL drift detected → {page.url[:80]}...")
-        log.warning(f"  Recovering: navigating back to listing...")
+    async def _recover(self, page: Page) -> bool:
+        log.warning(f"  URL drift → {page.url[:80]} — recovering...")
         try:
-            await page.goto(original_url, wait_until="domcontentloaded", timeout=25000)
+            await page.goto(self.url, wait_until="domcontentloaded", timeout=25000)
             await asyncio.sleep(rand_delay((2.0, 3.5)))
             await self._open_reviews_tab(page)
-            log.info("  Recovery successful — back on listing reviews panel")
             return True
         except Exception as e:
             log.error(f"  Recovery failed: {e}")
             return False
 
-    async def _scroll_and_extract_loop(self, page: Page):
-        scroller = ScrollEngine(page)
-        extractor = ReviewExtractor()
-        antiblock = AntiBlockManager(page)
+    # ── PHASE 1: NETWORK LOOP ─────────────────────────────────────────────────
 
-        container = await scroller.find_scroll_container()
-        total_written    = 0   # reviews written this session for this restaurant
-        scroll_cycle     = 0
-        drift_recoveries = 0
-        MAX_DRIFT_RECOVERIES = 5
+    async def _network_loop(self, page: Page) -> int:
+        """
+        Paginate Google Maps' internal RPC to get all reviews fast.
+        Returns number of reviews written.
+        Attributes will be empty — filled by Phase 2.
+        """
+        interceptor = NetworkInterceptor()
+        page.on("request", interceptor.on_request)
+        page.on("response", lambda r: None)  # keep listener count consistent
 
-        # ── Fetch place name and total review count once at start ──
+        extractor  = ReviewExtractor()
         place_name = await extractor.get_place_name(page)
-        total_on_listing = await extractor.get_total_review_count(page)
-        log.info(f"Place      : {place_name}")
-        log.info(f"Total reviews on listing: {total_on_listing or 'unknown'}")
-        log.info("Starting scroll-extract loop...")
+        log.info(f"[NET] Place: {place_name}")
+        log.info("[NET] Waiting for RPC endpoint interception...")
 
-        while not self._shutdown:
-            # ── Hard guards ──
+        await self._open_reviews_tab(page)
+
+        # Wait up to 30s for interception
+        wait_start = time.time()
+        while not interceptor.is_ready() and (time.time() - wait_start) < 30:
+            await asyncio.sleep(0.5)
+
+        if not interceptor.is_ready():
+            log.warning("[NET] RPC not intercepted after 30s — falling back to DOM mode")
+            log.warning("[NET] Possible causes: Maps changed RPC pattern, or ad blocker interference")
+            return 0  # caller will fall back to DOM
+
+        log.info(f"[NET] Endpoint: {interceptor.captured_url[:120]}...")
+
+        cookies = await self.session.get_cookies_str()
+        fetcher = NetworkReviewFetcher(interceptor, cookies)
+
+        total_written = 0
+        current_url   = interceptor.captured_url
+        page_num      = 0
+        no_new_pages  = 0
+
+        while not self._shutdown and current_url:
             if self._runtime_exceeded():
-                log.warning("⏱️  Max runtime reached — stopping")
+                log.warning("⏱️  Runtime exceeded")
                 break
             if self.csv.total_seen >= CFG["MAX_REVIEWS"]:
-                log.info(f"✅  Target of {CFG['MAX_REVIEWS']} reviews reached")
+                log.info("✅  Target reached")
                 break
 
-            # Smart completion: if we know the total, stop when we are within
-            # the final ~1% or 10 reviews (whichever is larger).
-            # Google withholds the last few reviews — no point hammering for them.
+            page_num += 1
+            reviews, next_token = await fetcher.fetch_page(page, current_url)
+
+            if not reviews:
+                no_new_pages += 1
+                if no_new_pages >= 3:
+                    log.info("[NET] No reviews in 3 consecutive pages — done")
+                    break
+                await asyncio.sleep(rand_delay(CFG["NETWORK_PAGINATION_DELAY"]))
+                continue
+            no_new_pages = 0
+
+            written = 0
+            for r in reviews:
+                r["place_name"] = place_name
+                if self.csv.write(r):
+                    written += 1
+                    total_written += 1
+
+            log.info(
+                f"[NET] Page {page_num:4d} | +{written:3d} | "
+                f"total={total_written} | csv={self.csv.total_seen}"
+            )
+
+            if next_token:
+                current_url = interceptor.build_next_page_url(next_token)
+            else:
+                log.info("[NET] No next pagination token — done")
+                break
+
+            await asyncio.sleep(rand_delay(CFG["NETWORK_PAGINATION_DELAY"]))
+
+        log.info(f"[NET] Phase 1 done. Written: {total_written} | Empty attrs: {len(self.csv.empty_attr_ids)}")
+        return total_written
+
+    # ── PHASE 2: TARGETED ATTRIBUTE FILL ─────────────────────────────────────
+
+    async def _attr_fill_loop(self, page: Page):
+        """
+        Phase 2 of hybrid mode: fill missing attributes for reviews written
+        in Phase 1. Instead of scrolling through all reviews, we:
+          1. Sort empty_attr_ids by their write index (stream order)
+          2. Jump-scroll to each card's approximate position
+          3. Scan ±20 cards around that position for the card
+          4. Expand it, extract only its chips, patch the CSV row
+
+        This is O(missing_attrs) not O(total_reviews).
+        """
+        if not self.csv.empty_attr_ids:
+            log.info("[FILL] No empty attrs — skipping Phase 2")
+            return
+
+        total_missing = len(self.csv.empty_attr_ids)
+        log.info(f"[FILL] Phase 2: filling attributes for {total_missing} reviews")
+
+        # Sort by index so we scroll forward through the list (cache-friendly)
+        sorted_ids = sorted(
+            self.csv.empty_attr_ids,
+            key=lambda rid: self.csv.id_to_index.get(rid, 999999)
+        )
+
+        extractor = ReviewExtractor()
+        scroller  = ScrollEngine(page)
+        container = await scroller.find_scroll_container()
+
+        filled  = 0
+        skipped = 0
+
+        for i, rid in enumerate(sorted_ids):
+            if self._shutdown or self._runtime_exceeded():
+                break
+
+            card_index = self.csv.id_to_index.get(rid, i)
+            log.info(
+                f"[FILL] {i+1}/{total_missing} | rid={rid[:20]}... | "
+                f"est_index={card_index}"
+            )
+
+            # Jump to approximate position
+            await scroller.jump_to_index(container, card_index)
+
+            # Scroll a bit forward/backward to load the card into DOM
+            found = await scroller.wait_for_card(rid, timeout=2.0)
+            if not found:
+                # Try scrolling a few times to load it
+                for _ in range(CFG["ATTR_FILL_MAX_SCROLL_ATTEMPTS"]):
+                    await scroller.scroll_once(container)
+                    await asyncio.sleep(0.3)
+                    found = await scroller.wait_for_card(rid, timeout=1.0)
+                    if found:
+                        break
+
+            if not found:
+                log.warning(f"[FILL] Card not found after scrolling: {rid[:20]}")
+                skipped += 1
+                continue
+
+            # Expand this specific card (target_ids limits expansion to just this card)
+            await extractor.expand_truncated(
+                page,
+                reviews_scraped=card_index,
+                target_ids=[rid]
+            )
+
+            # Small wait for chip hydration — use dynamic wait based on depth
+            await asyncio.sleep(expansion_wait(card_index))
+
+            # Extract only this card
+            reviews = await extractor.extract_visible(
+                page,
+                seen_ids=self.csv.seen_ids,
+                place_name="",  # not needed for patch
+                empty_attr_ids=self.csv.empty_attr_ids,
+                target_ids=[rid],
+            )
+
+            patched = False
+            for r in reviews:
+                if r.get("review_id") == rid and r.get("attributes", "").strip():
+                    if r.get("is_truncated"):
+                        # Chip still truncated after expansion — skip, will retry next run
+                        log.debug(f"[FILL] Still truncated: {rid[:20]}")
+                        break
+                    success = self.csv.patch_attributes(rid, r["attributes"])
+                    if success:
+                        filled += 1
+                        patched = True
+                        log.debug(f"[FILL] Patched: {rid[:20]} → {r['attributes'][:60]}")
+                    break
+
+            if not patched:
+                log.debug(f"[FILL] No attrs extracted for {rid[:20]}")
+
+            # Brief pause between cards to avoid hammering the renderer
+            await asyncio.sleep(random.uniform(0.2, 0.5))
+
+        remaining = len(self.csv.empty_attr_ids)
+        log.info(
+            f"[FILL] Phase 2 done. "
+            f"Filled: {filled}/{total_missing} | "
+            f"Skipped: {skipped} | "
+            f"Still missing: {remaining}"
+        )
+
+    # ── DOM MODE LOOP (standalone, with all fixes) ────────────────────────────
+
+    async def _dom_loop(self, page: Page):
+        scroller   = ScrollEngine(page)
+        extractor  = ReviewExtractor()
+        antiblock  = AntiBlockManager(page)
+
+        container       = await scroller.find_scroll_container()
+        total_written   = 0
+        scroll_cycle    = 0
+        drift_count     = 0
+        MAX_DRIFTS      = 5
+
+        place_name       = await extractor.get_place_name(page)
+        total_on_listing = await extractor.get_total_review_count(page)
+        log.info(f"Place: {place_name}  |  Total on listing: {total_on_listing or '?'}")
+
+        expanded = await extractor.expand_truncated(page, reviews_scraped=0)
+        log.info(f"Pre-expanded {expanded} buttons. Starting scroll loop...")
+        await asyncio.sleep(2.0)
+
+        while not self._shutdown:
+            if self._runtime_exceeded():
+                log.warning("⏱️  Max runtime reached")
+                break
+            if self.csv.total_seen >= CFG["MAX_REVIEWS"]:
+                log.info(f"✅  Target {CFG['MAX_REVIEWS']} reached")
+                break
+
             if total_on_listing > 0:
                 gap = total_on_listing - self.csv.total_seen
-                threshold = max(10, int(total_on_listing * 0.01))
-                if gap <= threshold and self.csv.total_seen > 0:
-                    log.info(
-                        f"✅  Collected {self.csv.total_seen}/{total_on_listing} reviews "
-                        f"(within {gap} of total — Google withholds the last few). Stopping."
-                    )
+                if gap <= max(10, int(total_on_listing * 0.01)) and self.csv.total_seen > 0:
+                    log.info(f"✅  Collected {self.csv.total_seen}/{total_on_listing} (within {gap}). Done.")
                     break
 
             if scroller.plateau_count >= CFG["MAX_SCROLL_PLATEAU"]:
-                log.info(
-                    f"📊 Plateau: {scroller.plateau_count} consecutive scroll cycles with "
-                    f"no new reviews. Collected {self.csv.total_seen}"
-                    + (f"/{total_on_listing}" if total_on_listing else "")
-                    + ". Stopping."
-                )
+                log.info(f"📊  Plateau reached. Collected {self.csv.total_seen}. Stopping.")
                 break
 
-            # ── URL drift check (catches reviewer profile navigation) ──
-            current_url = page.url
-            if not self._is_valid_listing_url(current_url):
-                drift_recoveries += 1
-                log.warning(f"⚠️  URL drift #{drift_recoveries}: not on listing page")
-                if drift_recoveries > MAX_DRIFT_RECOVERIES:
-                    log.error("Too many URL drifts — aborting to avoid scraping wrong data")
+            if not self._is_valid_url(page.url):
+                drift_count += 1
+                if drift_count > MAX_DRIFTS:
+                    log.error("Too many drifts — aborting")
                     break
-                recovered = await self._recover_to_listing(page, self.url)
-                if not recovered:
+                if not await self._recover(page):
                     break
                 container = await scroller.find_scroll_container()
                 scroller.plateau_count = 0
                 continue
 
-            # ── Anti-block check ──
             status = await antiblock.check()
             if status == "captcha":
                 await antiblock.handle_captcha()
@@ -1222,70 +1502,111 @@ class GoogleMapsReviewScraper:
             elif status == "slow":
                 await antiblock.apply_slow_mode()
 
-            # ── Scroll batch ──
-            prev_dom_count = await page.evaluate(
-                "() => document.querySelectorAll('div[data-review-id], div.jftiEf').length"
+            prev_count = await page.evaluate(
+                "() => document.querySelectorAll('div[data-review-id],div.jftiEf').length"
             )
-
             for _ in range(CFG["SCROLL_BATCH_SIZE"]):
-                # Check URL hasn't drifted mid-batch (click may have fired)
-                if not self._is_valid_listing_url(page.url):
-                    log.warning("  Mid-batch URL drift detected — breaking scroll batch")
+                if not self._is_valid_url(page.url):
+                    log.warning("Mid-batch URL drift")
                     break
                 await scroller.scroll_once(container)
                 await human_sleep(CFG["DELAY_BETWEEN_SCROLLS"])
                 await scroller.maybe_reverse_scroll(container)
                 await scroller.maybe_idle_pause()
-                alive = await micro_mouse_move(page)
-                if not alive:
-                    log.error("Browser appears closed — exiting scroll loop")
-                    self._shutdown = True
-                    break
+
+            alive = await micro_mouse_move(page)
+            if not alive:
+                log.error("Browser closed — exiting")
+                self._shutdown = True
+                break
 
             scroll_cycle += 1
 
-            # ── Wait for new content ──
-            new_nodes = await scroller.wait_for_new_content(prev_dom_count)
-            if new_nodes == 0:
-                scroller.plateau_count += 1
-                log.debug(f"No new nodes (plateau {scroller.plateau_count}/{CFG['MAX_SCROLL_PLATEAU']})")
-            else:
-                scroller.plateau_count = 0
+            new_nodes = await scroller.wait_for_new_content(prev_count)
+            scroller.plateau_count = 0 if new_nodes > 0 else scroller.plateau_count + 1
 
-            # ── Extract batch ──
-            new_reviews = await extractor.extract_visible(page, self.csv.seen_ids, place_name)
+            # FIX A: expand with dynamic wait based on depth
+            await extractor.expand_truncated(page, reviews_scraped=total_written)
+
+            new_reviews = await extractor.extract_visible(
+                page, self.csv.seen_ids, place_name, self.csv.empty_attr_ids
+            )
+
             written_this_batch = 0
             for review in new_reviews:
+                if review.get("is_truncated"):
+                    rid = review.get("review_id", "?")
+                    attempts = self._truncation_attempts.get(rid, 0) + 1
+                    self._truncation_attempts[rid] = attempts
+                    if attempts < 3:
+                        log.debug(f"Truncated (chip or text) {rid[:20]} — attempt {attempts}/3")
+                        continue
+                    log.debug(f"Truncated {rid[:20]} — gave up after 3, writing as-is")
                 if self.csv.write(review):
                     written_this_batch += 1
                     total_written += 1
 
+            # ── DOM PRUNING ────────────────────────────────────────────────────
+            keep_tail    = CFG["DOM_PRUNE_KEEP_TAIL"]
+            clean_every  = CFG["DOM_DEEP_CLEAN_EVERY"]
+            is_deep_clean = (total_written > 0 and total_written % clean_every < written_this_batch)
+
+            if is_deep_clean:
+                log.info(f"  [deep clean] {total_written} — purging DOM")
+                # FIX: preserve empty_attr_ids cards so retry loop can still reach them
+                empty_list = list(self.csv.empty_attr_ids)
+                await page.evaluate("""
+                ([keepTail, emptyArr]) => {
+                    const emptySet = new Set(emptyArr);
+                    const all = Array.from(document.querySelectorAll('[data-review-id]'));
+                    const anchors = new Set(all.slice(-keepTail).map(e => e.getAttribute('data-review-id')));
+                    all.forEach(el => {
+                        const rid = el.getAttribute('data-review-id');
+                        if (!rid) return;
+                        // FIX: never remove cards still needing attribute fill
+                        if (emptySet.has(rid)) return;
+                        if (anchors.has(rid)) return;
+                        const parent = el.parentElement ? el.parentElement.closest('[data-review-id]') : null;
+                        if (!parent) el.remove();
+                    });
+                }
+                """, [keep_tail, empty_list])
+                await asyncio.sleep(2.5)
+                container = await scroller.find_scroll_container()
+                log.info(f"  [deep clean] done")
+            else:
+                await page.evaluate("""
+                ([seenArr, emptyArr, keepTail]) => {
+                    const seenSet  = new Set(seenArr);
+                    const emptySet = new Set(emptyArr);
+                    const all = Array.from(document.querySelectorAll('[data-review-id]'));
+                    const anchors = new Set(all.slice(-keepTail).map(e => e.getAttribute('data-review-id')));
+                    all.forEach(el => {
+                        const rid = el.getAttribute('data-review-id');
+                        if (!rid || anchors.has(rid)) return;
+                        if (emptySet.has(rid)) return;  // FIX: preserve retry targets
+                        if (seenSet.has(rid)) {
+                            const parent = el.parentElement ? el.parentElement.closest('[data-review-id]') : null;
+                            if (!parent) el.remove();
+                        }
+                    });
+                }
+                """, [list(self.csv.seen_ids), list(self.csv.empty_attr_ids), keep_tail])
+
             if written_this_batch:
-                listing_pct = (
-                    f"{total_written/total_on_listing*100:.1f}%"
-                    if total_on_listing else "?%"
-                )
+                pct = f"{total_written/total_on_listing*100:.1f}%" if total_on_listing else "?%"
                 log.info(
-                    f"  Scroll cycle {scroll_cycle:4d} | "
-                    f"+{written_this_batch:3d} new | "
-                    f"this_restaurant={total_written:5d}/{total_on_listing or '?'} ({listing_pct}) | "
-                    f"csv_total={self.csv.total_seen:6d} | "
-                    f"scrolls={scroller.scroll_count:5d} | "
+                    f"  cycle={scroll_cycle:4d} | +{written_this_batch:3d} | "
+                    f"total={total_written}/{total_on_listing or '?'} ({pct}) | "
+                    f"scrolls={scroller.scroll_count} | "
+                    f"empty_attrs={len(self.csv.empty_attr_ids)} | "
+                    f"expand_wait={expansion_wait(total_written):.1f}s | "
                     f"runtime={int(time.time()-self._start_time)}s"
                 )
 
-            # ── Re-acquire scroll container periodically ──
-            if scroll_cycle % 30 == 0:
-                container = await scroller.find_scroll_container()
+        log.info(f"DOM loop done. This run: {total_written} | CSV total: {self.csv.total_seen}")
 
-        self._last_written = total_written
-        log.info(
-            f"Scroll loop finished. "
-            f"This restaurant: {total_written} reviews collected. "
-            f"CSV total (all restaurants): {self.csv.total_seen}"
-        )
-
-    # ── Public entry point ────────────────────────────────────────────────────
+    # ── PUBLIC ENTRY POINT ────────────────────────────────────────────────────
 
     async def run(self):
         self._register_signals()
@@ -1295,27 +1616,47 @@ class GoogleMapsReviewScraper:
         try:
             await self.session.start()
             page = self.session.page
-
-            # Page-level crash recovery
-            page.on("crash", lambda: log.error("Page crashed — attempting recovery"))
+            page.on("crash", lambda: log.error("Page crashed"))
 
             await self._navigate(page)
-            await self._open_reviews_tab(page)
-            await self._scroll_and_extract_loop(page)
+
+            if self.mode == "network":
+                log.info("Mode: NETWORK ONLY (no attribute fill)")
+                written = await self._network_loop(page)
+                if written == 0:
+                    log.info("Network interception failed — falling back to DOM mode")
+                    await self._open_reviews_tab(page)
+                    await self._dom_loop(page)
+
+            elif self.mode == "hybrid":
+                log.info("Mode: HYBRID (Phase 1: network bulk → Phase 2: DOM attribute fill)")
+                written = await self._network_loop(page)
+                if written == 0:
+                    log.warning("Network phase yielded nothing — running full DOM mode instead")
+                    await self._open_reviews_tab(page)
+                    await self._dom_loop(page)
+                else:
+                    if self.csv.empty_attr_ids and not self._shutdown:
+                        log.info(f"Phase 2: {len(self.csv.empty_attr_ids)} reviews need attribute fill")
+                        # Fresh page navigation for Phase 2 DOM pass
+                        await self._navigate(page)
+                        await self._open_reviews_tab(page)
+                        await asyncio.sleep(2.0)
+                        await self._attr_fill_loop(page)
+                    else:
+                        log.info("Phase 2: no missing attrs or shutdown — skipping")
+
+            else:  # dom
+                log.info("Mode: DOM ONLY (all fixes applied)")
+                await self._open_reviews_tab(page)
+                await self._dom_loop(page)
 
         except RuntimeError as e:
-            log.error(f"Fatal scraper error: {e}")
+            log.error(f"Fatal: {e}")
         except Exception as e:
-            err_str = str(e)
-            # TargetClosedError = browser window killed externally (Wayland crash,
-            # user closed window, OOM killer, etc.). Data already flushed to CSV.
-            if "TargetClosedError" in type(e).__name__ or "Target page" in err_str or "been closed" in err_str:
-                msg = (
-                    "Browser was closed unexpectedly (possibly Wayland/display crash). "
-                    f"Reviews saved so far: {self.csv.total_seen}. "
-                    "Re-run with the same --output file to resume."
-                )
-                log.warning(msg)
+            err = str(e)
+            if "TargetClosedError" in type(e).__name__ or "been closed" in err:
+                log.warning(f"Browser closed unexpectedly. Saved: {self.csv.total_seen}")
             else:
                 log.exception(f"Unexpected error: {e}")
         finally:
@@ -1325,146 +1666,61 @@ class GoogleMapsReviewScraper:
             log.info(
                 f"\n{'='*60}\n"
                 f"  DONE\n"
-                f"  Reviews extracted : {self.csv.total_seen}\n"
-                f"  Elapsed time      : {elapsed}s ({elapsed//60}m {elapsed%60}s)\n"
-                f"  Output file       : {self.csv.filepath}\n"
+                f"  Reviews total   : {self.csv.total_seen}\n"
+                f"  Missing attrs   : {len(self.csv.empty_attr_ids)}\n"
+                f"  Elapsed         : {elapsed}s ({elapsed//60}m {elapsed%60}s)\n"
+                f"  Output          : {self.csv.filepath}\n"
                 f"{'='*60}"
             )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI ENTRY POINT
+# CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
-SPEED_PROFILES = {
-    "turbo": {
-        "DELAY_BETWEEN_SCROLLS": (0.05, 0.2),
-        "DELAY_AFTER_CLICK":     (0.6, 1.2),
-        "DELAY_IDLE_PAUSE":      (1.5, 3.0),
-        "IDLE_PAUSE_EVERY":      (200, 400),
-        "REVERSE_SCROLL_EVERY":  (100, 200),
-        "SCROLL_BATCH_SIZE":     20,
-        "SCROLL_DISTANCE":       (1200, 2000),
-        "CONTENT_WAIT_TIMEOUT":  2.0,
-        "CONTENT_WAIT_POLL":     0.08,
-    },
-    "fast": {
-        "DELAY_BETWEEN_SCROLLS": (0.25, 0.7),
-        "DELAY_AFTER_CLICK":     (1.0, 2.2),
-        "DELAY_IDLE_PAUSE":      (3.0, 7.0),
-        "IDLE_PAUSE_EVERY":      (100, 180),
-        "REVERSE_SCROLL_EVERY":  (40, 80),
-        "SCROLL_BATCH_SIZE":     12,
-        "SCROLL_DISTANCE":       (800, 1400),
-        "CONTENT_WAIT_TIMEOUT":  3.0,
-        "CONTENT_WAIT_POLL":     0.12,
-    },
-    "safe": {
-        "DELAY_BETWEEN_SCROLLS": (1.8, 4.2),
-        "DELAY_AFTER_CLICK":     (2.0, 4.5),
-        "DELAY_IDLE_PAUSE":      (8.0, 20.0),
-        "IDLE_PAUSE_EVERY":      (40, 80),
-        "REVERSE_SCROLL_EVERY":  (12, 25),
-        "SCROLL_BATCH_SIZE":     5,
-        "SCROLL_DISTANCE":       (300, 700),
-        "CONTENT_WAIT_TIMEOUT":  8.0,
-        "CONTENT_WAIT_POLL":     0.4,
-    },
-}
-
-
-def apply_speed_profile(profile: str):
-    if profile not in SPEED_PROFILES:
-        log.warning(f"Unknown speed profile '{profile}' — using 'fast'")
-        profile = "fast"
-    CFG.update(SPEED_PROFILES[profile])
-    log.info(f"Speed profile: {profile.upper()}  |  "
-             f"scroll_delay={CFG['DELAY_BETWEEN_SCROLLS']}  "
-             f"batch={CFG['SCROLL_BATCH_SIZE']}  "
-             f"jump_dist={CFG['SCROLL_DISTANCE']}")
-
+def parse_runtime(value):
+    if not value: return 5_184_000
+    v = value.strip().lower()
+    if v.endswith("d"): return int(v[:-1]) * 86400
+    if v.endswith("h"): return int(v[:-1]) * 3600
+    if v.endswith("m"): return int(v[:-1]) * 60
+    return int(v)
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Google Maps Reviews Scraper",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Scrape until all reviews collected (no time/count limit):
-  python3 gmaps_reviews_scraper.py --url "..." --output out.csv
-
-  # Stop after 5000 reviews:
-  python3 gmaps_reviews_scraper.py --url "..." --output out.csv --max 5000
-
-  # Run for exactly 8 hours then stop (resume later):
-  python3 gmaps_reviews_scraper.py --url "..." --output out.csv --runtime 8h
-
-  # Run for 3 days:
-  python3 gmaps_reviews_scraper.py --url "..." --output out.csv --runtime 3d
-        """
-    )
-    parser.add_argument("--url", required=True, help="Full Google Maps listing URL")
-    parser.add_argument("--output", default="reviews.csv", help="Output CSV file path")
-    parser.add_argument(
-        "--max", type=int, default=0,
-        help="Maximum reviews to collect (default: no limit, scrape everything)"
-    )
-    parser.add_argument("--headless", action="store_true",
-                        help="Run headless (not recommended for Maps)")
-    parser.add_argument(
-        "--speed",
-        choices=["turbo", "fast", "safe"],
-        default="fast",
-        help=(
-            "Speed profile: "
-            "turbo=~80 rev/min (risky), "
-            "fast=~45 rev/min (default), "
-            "safe=~20 rev/min (stealth)"
-        ),
-    )
-    parser.add_argument(
-        "--runtime",
-        default=None,
-        help=(
-            "Max runtime before auto-stopping. Supports: "
-            "30m (30 minutes), 8h (8 hours), 3d (3 days), 60d (60 days). "
-            "Default: no limit (runs until all reviews collected)."
-        ),
-    )
-    return parser.parse_args()
-
-
-def parse_runtime(value: str) -> int:
-    """Convert runtime string like '8h', '3d', '90m' to seconds."""
-    if value is None:
-        return 5_184_000  # 60 days fallback
-    value = value.strip().lower()
-    if value.endswith("d"):
-        return int(value[:-1]) * 86400
-    if value.endswith("h"):
-        return int(value[:-1]) * 3600
-    if value.endswith("m"):
-        return int(value[:-1]) * 60
-    if value.endswith("s"):
-        return int(value[:-1])
-    # bare number = seconds
-    return int(value)
+    p = argparse.ArgumentParser(description="Google Maps Reviews Scraper v3 — Hybrid")
+    p.add_argument("--url",      required=True)
+    p.add_argument("--output",   default="reviews_v3.csv")
+    p.add_argument("--max",      type=int, default=0)
+    p.add_argument("--headless", action="store_true")
+    p.add_argument("--speed",    choices=["turbo","fast","safe"], default="fast")
+    p.add_argument("--runtime",  default=None, help="e.g. 8h, 3d, 90m")
+    p.add_argument("--mode",     choices=["dom","network","hybrid"], default="hybrid",
+                   help=(
+                       "hybrid  = network bulk + DOM attribute fill (DEFAULT, recommended)\n"
+                       "network = RPC interception only, no attributes\n"
+                       "dom     = DOM scroll only, all fixes applied, slower"
+                   ))
+    return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    # Max reviews: 0 means no limit
-    CFG["MAX_REVIEWS"] = args.max if args.max > 0 else 10_000_000
-
-    # Runtime
+    CFG["MAX_REVIEWS"]         = args.max if args.max > 0 else 10_000_000
     CFG["MAX_RUNTIME_SECONDS"] = parse_runtime(args.runtime)
-    runtime_desc = args.runtime or "no limit (until all reviews done)"
-    log.info(f"Runtime limit : {runtime_desc}  ({CFG['MAX_RUNTIME_SECONDS']}s)")
-    log.info(f"Reviews limit : {CFG['MAX_REVIEWS']:,}")
+    CFG["HEADLESS"]            = args.headless
 
-    CFG["HEADLESS"] = args.headless
-    apply_speed_profile(args.speed)
+    profile = SPEED_PROFILES.get(args.speed, SPEED_PROFILES["fast"])
+    CFG.update(profile)
 
-    scraper = GoogleMapsReviewScraper(url=args.url, output_csv=args.output)
+    log.info(
+        f"v3 | Speed: {args.speed.upper()} | Mode: {args.mode.upper()} | "
+        f"Max: {CFG['MAX_REVIEWS']:,} | Runtime: {args.runtime or 'no limit'}"
+    )
+
+    scraper = GoogleMapsReviewScraper(
+        url=args.url,
+        output_csv=args.output,
+        mode=args.mode,
+    )
     asyncio.run(scraper.run())
