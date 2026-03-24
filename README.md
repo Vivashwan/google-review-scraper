@@ -28,7 +28,7 @@ google-review-scraper/
 Auto-generated at runtime:
 ```
 ├── discovered_places.csv       ← all restaurants found, with scraped status
-├── all_reviews.csv             ← all collected reviews
+├── all_reviews.csv             ← all collected reviews 
 ├── scraper.log                 ← full log of every run
 └── gmaps_session/              ← browser cookies and session data
 ```
@@ -146,8 +146,9 @@ Finds all restaurants matching your query, then scrapes reviews from the top N s
 ```bash
 python3 discover_and_scrape.py \
   --query "restaurants in Hyderabad" \
-  --top 10 \
-  --output all_reviews.csv \
+  --places-file hyderabad_places.csv \
+  --output hyderabad_reviews_by_place \
+  --top 20 \
   --speed fast
 ```
 
@@ -167,16 +168,20 @@ python3 discover_and_scrape.py \
 ```bash
 # Scrape top 50 restaurants, stop after 8 hours
 python3 discover_and_scrape.py \
-  --query "restaurants in Hyderabad" \
-  --top 50 \
-  --output all_reviews.csv \
+  --query "restaurants in hyderabad" \
+  --places-file hyderabad_places.csv \
+  --output hyderabad_reviews_by_place \
+  --top 20 \
+  --speed fast
   --runtime 8h
 
 # Different city, safe speed for overnight
 python3 discover_and_scrape.py \
-  --query "restaurants in Mumbai" \
+  --query "restaurants in Hyderabad" \
+  --places-file hyderabad_places.csv \
+  --output hyderabad_reviews_by_place \
   --top 20 \
-  --output mumbai_reviews.csv \
+  --speed fast
   --speed safe
 ```
 
@@ -200,28 +205,10 @@ Scrape all reviews from one specific restaurant.
 **Step 2** — Run:
 
 ```bash
-python3 gmaps_reviews_scraper.py \
+python3 gmaps_hybrid_scraper.py \
   --url "https://www.google.com/maps/place/Paradise+Biryani/@17.44,78.48,17z/data=..." \
   --output paradise_reviews.csv \
   --speed fast
-```
-
-
-### To run gmaps_hybrid_scraper
-To run gmaps_hybrid_scraper using discover_and_scrape.py, then make change to discover_and_scrape.py:
-
-```bash
-from gmaps_hybrid_scraper import (
-    CFG, BrowserSession, ReviewCSVWriter, GoogleMapsReviewScraper,
-    rand_delay, micro_mouse_move, apply_speed_profile, parse_runtime, log,
-)
-```
-To run gmaps_hybrid_scraper to fetch single restaurant run:
- 
-```bash
-python3 gmaps_hybrid_scraper.py \
-  --url "https://www.google.com/maps/place/Paradise+Biryani/@17.4417141,78.4872154,17z/data=..." \
-  --output reviews.csv
 ```
 
 **Available flags:**
@@ -246,15 +233,16 @@ To resume, run the **exact same command** with the **same `--output` file**:
 ```bash
 # Interrupted after 3000 reviews? Just re-run:
 python3 discover_and_scrape.py \
-  --query "restaurants in Hyderabad" \
-  --top 10 \
-  --output all_reviews.csv \
+  --query "restaurants in hyderabad" \
+  --places-file hyderabad_places.csv \
+  --output hyderabad_reviews_by_place \
+  --top 20 \
   --speed fast
 ```
 
 The scraper will:
 - Skip all restaurants already marked as done in `discovered_places.csv`
-- Skip all reviews already in `all_reviews.csv`
+- Skip all reviews already in `hyderabad_reviews_by_place.csv`
 - Continue from the next unfinished restaurant
 
 ---
@@ -300,8 +288,9 @@ gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-tim
 
 python3 discover_and_scrape.py \
   --query "restaurants in Hyderabad" \
+  --places-file hyderabad_places.csv \
+  --output hyderabad_reviews_by_place \
   --top 20 \
-  --output all_reviews.csv \
   --speed fast
 ```
 
