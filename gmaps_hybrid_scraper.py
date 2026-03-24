@@ -537,9 +537,10 @@ class GoogleMapsHybridScraper:
     parses complete review data from the response (no DOM reading).
     """
 
-    def __init__(self, url: str, output_csv: str, place_name: str = ""):
+    def __init__(self, url: str, output_csv: str, place_name: str = "", expected_total: int = 0):
         self.url        = url
         self.place_name = place_name or "Unknown Place"
+        self.expected_total = int(expected_total or 0)
         self.csv        = ReviewCSVWriter(output_csv)
         self.parser     = APIResponseParser()
         self._shutdown  = False
@@ -714,24 +715,55 @@ class GoogleMapsHybridScraper:
         try:
             count = await page.evaluate(r"""
             () => {
-                const btns = document.querySelectorAll('button[jsaction*="reviews"], [aria-label*="reviews"]');
+                const parseCount = (raw) => {
+                    if (!raw) return 0;
+                    const txt = String(raw).replace(/,/g, '').trim().toLowerCase();
+                    const m = txt.match(/(\d+(?:\.\d+)?)\s*([km])?\s+reviews?/i);
+                    if (!m) return 0;
+                    const num = parseFloat(m[1]);
+                    const suffix = (m[2] || '').toLowerCase();
+                    if (!Number.isFinite(num)) return 0;
+                    if (suffix === 'k') return Math.round(num * 1000);
+                    if (suffix === 'm') return Math.round(num * 1000000);
+                    return Math.round(num);
+                };
+
+                // 1) Prefer dedicated review-tab/button labels.
+                let best = 0;
+                const btns = document.querySelectorAll('button[jsaction*="reviews"], button[aria-label*="reviews"]');
                 for (const btn of btns) {
-                    const lbl = (btn.getAttribute('aria-label') || '').replace(/,/g, '');
-                    const m = lbl.match(/(\d+)\s+reviews?/i);
-                    if (m) return parseInt(m[1]);
+                    const c = parseCount(btn.getAttribute('aria-label'));
+                    if (c > best) best = c;
                 }
-                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-                let node;
-                while ((node = walker.nextNode())) {
-                    const m = node.textContent.replace(/,/g,'').match(/(\d{2,})\s+reviews?/i);
-                    if (m) return parseInt(m[1]);
+
+                // 2) Also scan a few high-signal containers only (avoid entire body to
+                // prevent picking star-breakdown rows like "1,267 reviews").
+                const scoped = document.querySelectorAll(
+                    'h1, h2, div[role="main"], div[role="region"], div[aria-label*="reviews"]'
+                );
+                for (const el of scoped) {
+                    const c = parseCount(el.getAttribute('aria-label'));
+                    if (c > best) best = c;
+                    const t = parseCount(el.innerText || '');
+                    if (t > best) best = t;
                 }
-                return 0;
+
+                return best || 0;
             }
             """)
             return int(count) if count else 0
         except Exception:
             return 0
+
+    async def _resolve_target_review_count(self, listing_total: int) -> int:
+        if self.expected_total > 0 and listing_total > 0 and listing_total != self.expected_total:
+            log.warning(
+                f"Review-count mismatch: input={self.expected_total} vs page={listing_total}. "
+                f"Using input value."
+            )
+        if self.expected_total > 0:
+            return self.expected_total
+        return listing_total
 
     # ── Scroll loop ───────────────────────────────────────────────────────────
 
@@ -772,8 +804,11 @@ class GoogleMapsHybridScraper:
         next_reverse_at = random.randint(*CFG["REVERSE_SCROLL_EVERY"])
         slow_mode_count = 0
 
-        total_on_listing = await self._get_total_review_count(page)
-        log.info(f"Total reviews on listing: {total_on_listing or '?'}")
+        page_total = await self._get_total_review_count(page)
+        total_on_listing = await self._resolve_target_review_count(page_total)
+        log.info(f"Total reviews on listing: {page_total or '?'}")
+        if self.expected_total > 0:
+            log.info(f"Target reviews from input: {self.expected_total}")
         log.info("Starting scroll loop — intercepting API responses...")
 
         # Initial drain — first load may have already triggered API calls
@@ -874,6 +909,7 @@ class GoogleMapsHybridScraper:
         self._register_signals()
         self._start_time = time.time()
         self.csv.open()
+        status = "ok"
 
         try:
             await self._start_browser()
@@ -894,12 +930,15 @@ class GoogleMapsHybridScraper:
 
         except RuntimeError as e:
             log.error(f"Fatal: {e}")
+            status = "fatal"
         except Exception as e:
             err = str(e)
             if "TargetClosedError" in type(e).__name__ or "been closed" in err:
                 log.warning(f"Browser closed. Saved: {self.csv.total_seen}")
+                status = "browser_closed"
             else:
                 log.exception(f"Unexpected error: {e}")
+                status = "error"
         finally:
             self.csv.close()
             await self._stop_browser()
@@ -912,6 +951,11 @@ class GoogleMapsHybridScraper:
                 f"  Output       : {self.csv.filepath}\n"
                 f"{'='*60}"
             )
+        return {
+            "status": status,
+            "reviews": self.csv.total_seen,
+            "output": self.csv.filepath,
+        }
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -941,6 +985,8 @@ Examples:
     p.add_argument("--headless", action="store_true")
     p.add_argument("--speed",    choices=["turbo","fast","safe"], default="fast")
     p.add_argument("--runtime",  default=None, help="e.g. 8h, 3d, 90m")
+    p.add_argument("--expected-total", type=int, default=0,
+                   help="Optional review count from your input file. Used as stop target.")
     return p.parse_args()
 
 
@@ -958,5 +1004,6 @@ if __name__ == "__main__":
         url=args.url,
         output_csv=args.output,
         place_name=args.place,
+        expected_total=args.expected_total,
     )
     asyncio.run(scraper.run())
