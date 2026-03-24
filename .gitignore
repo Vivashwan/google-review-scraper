@@ -16,3 +16,4 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+gmaps_session_hybrid/
